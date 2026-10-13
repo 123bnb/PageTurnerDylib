@@ -5,6 +5,9 @@ on:
     branches: [ main ]
     tags: [ 'v*' ]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-latest
@@ -59,6 +62,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: out/PageTurnerDylib.dylib
+          name: PageTurnerDylib ${{ github.ref_name }}
+          body: |
+            PageTurnerDylib v${{ github.ref_name }} — 独立 dylib 版（巨魔注入器 TrollFools 注入任意 App，三指长按弹出设置菜单）
           draft: false
           prerelease: false
-          generate_release_notes: true
