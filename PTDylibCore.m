@@ -30,6 +30,12 @@
 #import "ptftouch/PTFakeMetaTouch.h"
 #import "PTDylibShared.h"
 
+// 测试 sink 协议方法（sTestLogSink 为 id 类型，需编译器可见的声明才能调用）
+@interface NSObject (PTTestSink)
+- (void)appendLog:(NSString *)s;
+- (void)drawTrailWithDirection:(double)dir dist:(double)dist phase:(int)phase;
+@end
+
 // ============================================================
 // 常量
 // ============================================================
