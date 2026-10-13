@@ -27,7 +27,7 @@ extern BOOL sCollectArmed;     // 学习页打开 = YES
 extern BOOL sTestArmed;        // 测试页打开 = YES
 extern double sLastSampleAt;   // 最近样本时间（学习页诊断）
 extern UIView *sTestDot;       // 测试页绿点视图
-extern id sTestLogSink;        // 测试页实时记录区（弱引用）
+extern __weak id sTestLogSink;   // 测试页实时记录区（弱引用）
 extern void PTDylibSetLearningLocal(BOOL on);   // 写 learning.active + 清样本
 
 // ---------- 工具（core 定义，UI 复用） ----------
