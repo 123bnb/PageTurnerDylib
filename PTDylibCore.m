@@ -1,0 +1,1285 @@
+// ============================================================
+// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.0）
+//
+// 从 deb 版 PageTurner v1.0.43 移植：
+//   · Tweak.xm 的运行拦截/匹配/执行/可视化（去掉 Preferences 进程分支、总开关、
+//     指定 App 生效、探针、注入标记——dylib 注入即生效）
+//   · RootListController.m 的学习/测试采集 + 测试执行（S 系列）
+// 与 deb 版的关键差异：
+//   · hook 用 method_getImplementation + method_setImplementation（无 ellekit，
+//     参考 DirectVolumeTap 纯 clang + ldid 注入方案）
+//   · 学习/测试采集与运行拦截合并为同一对 hook（PTDylibAddEvent/PTDylibSendEvent）：
+//     学习/测试激活时只采集放行不拦截；否则正常运行拦截
+//   · 配置：有 deb 版配置（com.yourname.pageturner.plist 5 候选路径）就复用；
+//     没有则自建独立配置 com.yourname.pageturnerdylib.plist
+//   · 日志：统一 PTDylibLog（内存 200 条 + 文件 PageTurnerDylib.log 1000 行循环）
+// ============================================================
+
+#import <UIKit/UIKit.h>
+#import <Foundation/Foundation.h>
+#import <CoreFoundation/CoreFoundation.h>
+#import <objc/runtime.h>
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
+#import <sys/time.h>
+#import <stdio.h>
+#import <stdlib.h>
+#import <string.h>
+#import <stdarg.h>
+#import <unistd.h>
+#import "ptftouch/PTFakeMetaTouch.h"
+#import "PTDylibShared.h"
+
+// ============================================================
+// 常量
+// ============================================================
+static NSString *kDebPrefsName = @"com.yourname.pageturner.plist";
+static NSString *kDylibPrefsName = @"com.yourname.pageturnerdylib.plist";
+static NSString *kDylibLogName = @"PageTurnerDylib.log";
+static const double kPagerWindowSec = 0.4;       // 翻页器活跃窗口（已学 sender 开窗）
+static const double kCollectWindowSec = 0.05;    // 学习/测试采集窗口（addEvent 刷新）
+static const double kTapDistThreshold = 30.0;    // 位移 <30pt 判定 tap
+static const double kDirTolerance = 15.0;        // 方向容差 ±15°
+static const double kDistSlack = 30.0;           // 位移区间匹配裕度
+static const double kTapDistSlack = 0.15;        // 点击位移区间容差
+static const double kTapDxThresh = 0.05;         // 点击位移方向判定阈值
+static const int kLearnMin = 5;                  // 学习下限
+static const int kLearnMax = 15;                 // 学习上限
+static const double kConverge = 60.0;            // 位移收敛阈值
+static const int kMaxLearnedSenders = 64;        // 已学 sender 上限
+
+// ptftouch/Compat.h 声明了 extern gInjectSender（本库未使用，补实体防止动态查找落空）
+uint64_t gInjectSender = 0;
+
+// ============================================================
+// 日志（内存 200 条 + 文件 PageTurnerDylib.log 1000 行循环，受 debugLogEnabled 控制）
+// ============================================================
+static NSMutableArray *sLogLines = nil;
+static NSString *sLogFile = nil;
+static double sLogCfgMtime = -1;
+static BOOL sLogEnabled = YES;
+
+static NSString *PTJbrootRoot(void);   // 前向声明
+
+// 日志文件候选：App 容器 Documents / /var/mobile/Documents / jbroot 变体
+static NSString *PTDylibLogFilePath(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray *dirs = [NSMutableArray array];
+    NSArray *base = @[
+        [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject],
+        NSHomeDirectory() ? [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] : nil,
+        NSTemporaryDirectory(),
+        @"/var/mobile/Documents",
+    ];
+    for (NSString *d in base) {
+        if (!d.length || [dirs containsObject:d]) continue;
+        [dirs addObject:d];
+    }
+    NSString *jb = PTJbrootRoot();
+    if (jb.length) {
+        NSString *jbDoc = [jb stringByAppendingPathComponent:@"var/mobile/Documents"];
+        if (![dirs containsObject:jbDoc]) [dirs addObject:jbDoc];
+    }
+    for (NSString *d in dirs) {
+        if (![fm fileExistsAtPath:d]) [fm createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil];
+        if ([fm isWritableFileAtPath:d]) return [d stringByAppendingPathComponent:kDylibLogName];
+    }
+    return nil;
+}
+
+static void PTDylibEnsureLogFile(NSString *path) {
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *dir = [path stringByDeletingLastPathComponent];
+        if (dir.length && ![fm fileExistsAtPath:dir]) {
+            [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        }
+        if (![fm fileExistsAtPath:path]) [fm createFileAtPath:path contents:nil attributes:nil];
+    } @catch (NSException *e) {}
+}
+
+static void PTDylibTrimLogFile(NSString *path) {
+    @try {
+        NSString *content = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+        if (!content) return;
+        NSArray *lines = [content componentsSeparatedByString:@"\n"];
+        if (lines.count > 1000) {
+            NSArray *keep = [lines subarrayWithRange:NSMakeRange(lines.count - 1000, 1000)];
+            [[keep componentsJoinedByString:@"\n"] writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+    } @catch (NSException *e) {}
+}
+
+// 开关改动即时生效（mtime 缓存）
+static void PTDylibLogRefreshCfg(void) {
+    NSString *p = PTDylibCfgPath();
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
+    double mtime = attrs ? [attrs.fileModificationDate timeIntervalSince1970] : 0;
+    if (mtime == sLogCfgMtime) return;
+    sLogCfgMtime = mtime;
+    NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:p];
+    sLogEnabled = (cfg[@"debugLogEnabled"] == nil) ? YES : [cfg[@"debugLogEnabled"] boolValue];
+}
+
+void PTDylibLog(NSString *fmt, ...) {
+    PTDylibLogRefreshCfg();
+    if (!sLogEnabled) return;
+    if (!sLogLines) sLogLines = [NSMutableArray array];
+    va_list ap; va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    struct timeval tv; gettimeofday(&tv, NULL);
+    time_t sec = tv.tv_sec; struct tm tmv; localtime_r(&sec, &tmv);
+    char tbuf[64]; strftime(tbuf, sizeof(tbuf), "%H:%M:%S", &tmv);
+    NSString *line = [NSString stringWithFormat:@"%s.%03d %@", tbuf, (int)(tv.tv_usec / 1000), msg];
+    if (sLogLines.count >= 200) [sLogLines removeObjectsInRange:NSMakeRange(0, 100)];
+    [sLogLines addObject:line];
+    if (!sLogFile) sLogFile = PTDylibLogFilePath();
+    if (sLogFile) {
+        static int sFileLines = 0;
+        PTDylibEnsureLogFile(sLogFile);
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:sLogFile];
+        if (fh) {
+            @try {
+                [fh seekToEndOfFile];
+                [fh writeData:[[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
+                [fh closeFile];
+                sFileLines++;
+            } @catch (NSException *e) {}
+        }
+        if (sFileLines > 1000) { PTDylibTrimLogFile(sLogFile); sFileLines = 1000; }
+    }
+}
+
+NSArray *PTDylibLogLines(void) {
+    return sLogLines ? [sLogLines copy] : @[];
+}
+
+double PTNowC(void) {
+    struct timeval tv; gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
+
+// ============================================================
+// 配置路径选择
+// 规则（用户定稿）：有 deb 版配置（5 候选路径任一存在）→ 复用 deb 配置；
+//                   没有 → 自建独立配置 com.yourname.pageturnerdylib.plist
+// ============================================================
+static NSString *gCfgPath = nil;
+static BOOL gUsingDebCfg = NO;
+
+static NSString *PTJbrootRoot(void) {
+    static NSString *root = nil;
+    static dispatch_once_t on;
+    dispatch_once(&on, ^{
+        uint32_t n = _dyld_image_count();
+        for (uint32_t i = 0; i < n; i++) {
+            const char *img = _dyld_get_image_name(i);
+            if (!img) continue;
+            NSString *p = [NSString stringWithUTF8String:img];
+            NSRange r = [p rangeOfString:@"/.jbroot-"];
+            if (r.location == NSNotFound) continue;
+            NSRange after = NSMakeRange(NSMaxRange(r), p.length - NSMaxRange(r));
+            NSRange slash = [p rangeOfString:@"/" options:0 range:after];
+            NSUInteger end = (slash.location != NSNotFound) ? slash.location : p.length;
+            root = [p substringToIndex:end];
+            break;
+        }
+    });
+    return root;
+}
+
+// 生成 5 候选路径（与 deb PTGlobalPlistPath 同模式）
+static NSArray *PTDylibCandidatePaths(NSString *name) {
+    NSMutableArray *cands = [NSMutableArray array];
+    [cands addObject:[@"/var/mobile/Library/Preferences" stringByAppendingPathComponent:name]];
+    NSString *jb = PTJbrootRoot();
+    if (jb.length) {
+        [cands addObject:[jb stringByAppendingPathComponent:[@"var/mobile/Library/Preferences" stringByAppendingPathComponent:name]]];
+        [cands addObject:[jb stringByAppendingPathComponent:[@"Library/Preferences" stringByAppendingPathComponent:name]]];
+    }
+    [cands addObject:[@"/var/jb/var/mobile/Library/Preferences" stringByAppendingPathComponent:name]];
+    [cands addObject:[@"/var/jb/Library/Preferences" stringByAppendingPathComponent:name]];
+    return cands;
+}
+
+// 启动时决定一次：deb 配置存在 → 复用；否则 dylib 独立（首选路径）
+static void PTDylibInitConfigPath(void) {
+    if (gCfgPath) return;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    for (NSString *p in PTDylibCandidatePaths(kDebPrefsName)) {
+        if ([fm fileExistsAtPath:p]) { gCfgPath = p; gUsingDebCfg = YES; return; }
+    }
+    for (NSString *p in PTDylibCandidatePaths(kDylibPrefsName)) {
+        if ([fm fileExistsAtPath:p]) { gCfgPath = p; gUsingDebCfg = NO; return; }
+    }
+    // 都没有 → 独立配置主路径（首次写入时创建）
+    gCfgPath = [@"/var/mobile/Library/Preferences" stringByAppendingPathComponent:kDylibPrefsName];
+    gUsingDebCfg = NO;
+}
+
+NSString *PTDylibCfgPath(void) {
+    PTDylibInitConfigPath();
+    return gCfgPath;
+}
+
+BOOL PTDylibUsingDebConfig(void) {
+    PTDylibInitConfigPath();
+    return gUsingDebCfg;
+}
+
+// ============================================================
+// 配置读写（原子写；当前路径 + jbroot 镜像路径双写）
+// ============================================================
+NSMutableDictionary *PTDylibReadCfg(void) {
+    NSString *p = PTDylibCfgPath();
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
+    return d ? [NSMutableDictionary dictionaryWithDictionary:d] : [NSMutableDictionary dictionary];
+}
+
+void PTDylibWriteCfg(NSDictionary *cfg) {
+    NSData *data = [NSPropertyListSerialization dataWithPropertyList:cfg
+        format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL];
+    if (!data) return;
+    NSString *p = PTDylibCfgPath();
+    NSMutableArray *targets = [NSMutableArray array];
+    // jbroot 镜像路径（App 沙盒重定向下仍可读）+ 当前路径
+    NSString *fileName = [p lastPathComponent];
+    NSString *jb = PTJbrootRoot();
+    if (jb.length) {
+        [targets addObject:[jb stringByAppendingPathComponent:
+            [@"var/mobile/Library/Preferences" stringByAppendingPathComponent:fileName]]];
+        [targets addObject:[jb stringByAppendingPathComponent:
+            [@"Library/Preferences" stringByAppendingPathComponent:fileName]]];
+    }
+    if (![targets containsObject:p]) [targets addObject:p];
+    for (NSString *t in targets) {
+        NSString *tmp = [t stringByAppendingString:@".tmp"];
+        [data writeToFile:tmp atomically:YES];
+        [[NSFileManager defaultManager] removeItemAtPath:t error:nil];
+        [[NSFileManager defaultManager] moveItemAtPath:tmp toPath:t error:nil];
+    }
+}
+
+void PTDylibSetLearningLocal(BOOL on) {
+    NSMutableDictionary *cfg = PTDylibReadCfg();
+    cfg[@"learning"] = @{ @"active": @(on) };
+    if (on) cfg[@"learningSamples"] = @[];
+    PTDylibWriteCfg(cfg);
+}
+
+// ============================================================
+// 运行端配置缓存（mtime；无总开关/无指定 App——dylib 注入即生效）
+// ============================================================
+static NSDictionary *gConfig = nil;
+static double gConfigMtime = 0;
+static double gDebounceMs = 300;
+static BOOL gDebugDots = NO;
+static BOOL gDebugLogEnabled = YES;
+static NSMutableDictionary *gPlans = nil;      // name -> dict
+static BOOL gLearnActive = NO;
+static uint64_t gLearnedSenders[kMaxLearnedSenders];
+static int gLearnedSenderCount = 0;
+
+static void PTDylibLoadConfig(BOOL force) {
+    NSString *p = PTDylibCfgPath();
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
+    double mtime = attrs ? [attrs.fileModificationDate timeIntervalSince1970] : 0;
+    if (!force && gConfig && mtime == gConfigMtime) return;
+    NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:p];
+    gConfig = cfg ? cfg : @{};
+    gConfigMtime = mtime;
+    double db = [gConfig[@"debounceMs"] doubleValue];
+    gDebounceMs = (db > 0) ? db : 300;
+    gDebugDots = [gConfig[@"debugDots"] boolValue];
+    gDebugLogEnabled = (gConfig[@"debugLogEnabled"] == nil) ? YES : [gConfig[@"debugLogEnabled"] boolValue];
+    gPlans = [NSMutableDictionary dictionary];
+    gLearnedSenderCount = 0;
+    for (NSDictionary *pl in gConfig[@"plans"] ?: @[]) {
+        if (!pl[@"name"]) continue;
+        gPlans[pl[@"name"]] = pl;
+        NSArray *fts = pl[@"features"] ?: (pl[@"feature"] ? @[pl[@"feature"]] : @[]);
+        for (NSDictionary *ft in fts) {
+            if (ft[@"sender"]) {
+                unsigned long long s = 0;
+                NSScanner *sc = [NSScanner scannerWithString:ft[@"sender"]];
+                if ([sc scanHexLongLong:&s] && gLearnedSenderCount < kMaxLearnedSenders) {
+                    gLearnedSenders[gLearnedSenderCount++] = s;
+                }
+            }
+        }
+    }
+    gLearnActive = [gConfig[@"learning"][@"active"] boolValue];
+}
+
+// ============================================================
+// IOKit（sender 读取）
+// ============================================================
+typedef uint32_t (*IOHIDEventGetType_t)(void *);
+typedef uint64_t (*IOHIDEventGetSenderID_t)(void *);
+typedef double (*IOHIDEventGetFloatValue_t)(void *, uint32_t);
+static IOHIDEventGetType_t pGetType = NULL;
+static IOHIDEventGetSenderID_t pGetSender = NULL;
+static IOHIDEventGetFloatValue_t pGetFloat = NULL;
+
+// ============================================================
+// 会话状态（学习/测试，UI 层读写 → extern）
+// ============================================================
+BOOL sCollectArmed = NO;
+BOOL sTestArmed = NO;
+double sLastSampleAt = 0;
+UIView *sTestDot = nil;
+__weak id sTestLogSink = nil;
+
+static uint64_t sCurSender = 0;
+static double sWindowUntil = 0;
+static BOOL sSessActive = NO;
+static double sSessDist = 0, sSessFirstDir = 0;
+static BOOL sSessHasMove = NO;
+static CGPoint sSessLast = {0, 0};
+static CGPoint sSessStart = {0, 0};
+static BOOL sTestInjecting = NO;      // 测试执行注入保护
+static double sLastTestExec = 0;      // 测试防抖
+
+// 学习样本写入 plist（learningSamples，学习页轮询读取）
+static void SAppendSample(int phase, double dir, double dist, int tapDx) {
+    NSMutableDictionary *cfg = PTDylibReadCfg();
+    if (![cfg[@"learning"][@"active"] boolValue]) return;
+    NSMutableArray *samples = [NSMutableArray arrayWithArray:cfg[@"learningSamples"] ?: @[]];
+    [samples addObject:@{
+        @"sender": [NSString stringWithFormat:@"0x%llx", sCurSender],
+        @"phase": @(phase), @"direction": @(dir), @"dist": @(dist),
+        @"tapDx": @(tapDx),
+    }];
+    cfg[@"learningSamples"] = samples;
+    PTDylibWriteCfg(cfg);
+    PTDylibLog(@"sample: sender=0x%llx phase=%d dir=%.1f dist=%.1f tapDx=%d (总数%lu)",
+        sCurSender, phase, dir, dist, tapDx, (unsigned long)samples.count);
+    sLastSampleAt = PTNowC();
+}
+
+// ============================================================
+// 工具（UI 层复用）
+// ============================================================
+NSArray *PTFeaturesOfPlan(NSDictionary *p) {
+    if (p[@"features"]) return p[@"features"];
+    if (p[@"feature"]) return @[p[@"feature"]];
+    return @[];
+}
+
+NSString *PTDirName(double dir) {
+    if (dir >= 45 && dir <= 135) return @"下";
+    if (dir > 135 || dir < -135) return @"左";
+    if (dir >= -135 && dir < -45) return @"上";
+    return @"右";
+}
+
+NSString *PTActionText(NSDictionary *a) {
+    NSString *t = a[@"type"];
+    if ([t isEqualToString:@"tap"]) return [NSString stringWithFormat:@"点击(%d, %d)", (int)[a[@"x"] doubleValue], (int)[a[@"y"] doubleValue]];
+    if ([t isEqualToString:@"doubleTap"]) return [NSString stringWithFormat:@"双击(%d, %d)", (int)[a[@"x"] doubleValue], (int)[a[@"y"] doubleValue]];
+    if ([t isEqualToString:@"swipe"]) return [NSString stringWithFormat:@"滑动 (%d,%d)→(%d,%d)", (int)[a[@"x1"] doubleValue], (int)[a[@"y1"] doubleValue], (int)[a[@"x2"] doubleValue], (int)[a[@"y2"] doubleValue]];
+    if ([t isEqualToString:@"delay"]) return [NSString stringWithFormat:@"延迟 %.0fms", [a[@"ms"] doubleValue]];
+    if ([t isEqualToString:@"volumeUp"]) return @"音量+";
+    if ([t isEqualToString:@"volumeDown"]) return @"音量-";
+    if ([t isEqualToString:@"muteToggle"]) return @"静音切换";
+    return t;
+}
+
+NSString *PTDuplicate(NSDictionary *s, NSArray *plans) {
+    NSString *snd = s[@"sender"];
+    int phase = [s[@"phase"] intValue];
+    double dir = [s[@"direction"] doubleValue];
+    double dist = [s[@"dist"] doubleValue];
+    int tapDx = [s[@"tapDx"] intValue];
+    for (NSDictionary *p in plans) {
+        for (NSDictionary *ft in PTFeaturesOfPlan(p)) {
+            if (![ft[@"sender"] isEqualToString:snd]) continue;
+            if ([ft[@"phase"] intValue] != phase) continue;
+            double pd = [ft[@"direction"] doubleValue];
+            double d = fabs(fabs(dir - pd)); if (d > 180) d = 360 - d;
+            if (d > kDirTolerance) continue;
+            if (phase == 1) {
+                double lo = [ft[@"distMin"] doubleValue], hi = [ft[@"distMax"] doubleValue];
+                if (dist < lo - kDistSlack || dist > hi + kDistSlack) continue;
+            } else {
+                if (ft[@"tapDx"] && tapDx != [ft[@"tapDx"] intValue]) continue;
+                if (ft[@"distMin"]) {
+                    double lo = [ft[@"distMin"] doubleValue], hi = [ft[@"distMax"] doubleValue];
+                    if (dist < lo - kTapDistSlack || dist > hi + kTapDistSlack) continue;
+                }
+            }
+            return p[@"name"];
+        }
+    }
+    return nil;
+}
+
+BOOL PTStable(NSArray *mem, NSString *sender) {
+    NSMutableArray *same = [NSMutableArray array];
+    for (NSDictionary *s in mem) if ([s[@"sender"] isEqualToString:sender]) [same addObject:s];
+    if (same.count < kLearnMin) return NO;
+    NSInteger n = same.count;
+    double dir = [same[n-1][@"direction"] doubleValue];
+    for (NSInteger i = n - kLearnMin; i < n; i++) {
+        double d = [same[i][@"direction"] doubleValue];
+        double diff = fabs(fabs(dir - d)); if (diff > 180) diff = 360 - diff;
+        if (diff > kDirTolerance) return NO;
+    }
+    if ([same[n-1][@"phase"] intValue] == 1) {
+        double lo = DBL_MAX, hi = 0;
+        for (NSInteger i = n - kLearnMin; i < n; i++) {
+            double v = [same[i][@"dist"] doubleValue];
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+        }
+        if (hi - lo > kConverge) return NO;
+    }
+    return YES;
+}
+
+// ============================================================
+// 测试模式（大白屏 + 绿点可视化 + 执行链路验证）
+// ============================================================
+static NSString *PTTestMatchFeature(int phase, double dir, double dist, uint64_t sender, int tapDx) {
+    NSString *best = nil; double bestScore = DBL_MAX;
+    for (NSDictionary *p in (PTDylibReadCfg()[@"plans"] ?: @[])) {
+        for (NSDictionary *ft in PTFeaturesOfPlan(p)) {
+            if (ft[@"sender"]) {
+                unsigned long long s = 0;
+                NSScanner *sc = [NSScanner scannerWithString:ft[@"sender"]];
+                if (![sc scanHexLongLong:&s] || s != sender) continue;
+            }
+            if ([ft[@"phase"] intValue] != phase) continue;
+            double pd = [ft[@"direction"] doubleValue];
+            double d = fabs(fabs(dir - pd)); if (d > 180) d = 360 - d;
+            if (d > 15.0) continue;
+            double lo = 0, hi = 0;
+            if (phase == 1) {
+                lo = [ft[@"distMin"] doubleValue];
+                hi = [ft[@"distMax"] doubleValue];
+                if (dist < lo - 30.0 || dist > hi + 30.0) continue;
+            } else {
+                if (ft[@"tapDx"]) {
+                    if (tapDx != [ft[@"tapDx"] intValue]) continue;
+                }
+                if (ft[@"distMin"]) {
+                    lo = [ft[@"distMin"] doubleValue];
+                    hi = [ft[@"distMax"] doubleValue];
+                    if (dist < lo - kTapDistSlack || dist > hi + kTapDistSlack) continue;
+                }
+            }
+            double score = d + (phase == 1 ? fabs(dist - (lo + hi) / 2.0) / 100.0 : 0);
+            if (score < bestScore) { bestScore = score; best = p[@"name"]; }
+        }
+    }
+    return best;
+}
+
+void PTTestShowDot(CGPoint from, CGPoint to, BOOL animate, double dur) {
+    if (!sTestDot) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        sTestDot.hidden = NO;
+        sTestDot.alpha = 0.9;
+        sTestDot.center = from;
+        if (animate) {
+            [UIView animateWithDuration:dur animations:^{ sTestDot.center = to; }
+                completion:^(BOOL f) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        sTestDot.alpha = 0; sTestDot.hidden = YES;
+                    });
+                }];
+        } else {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                sTestDot.alpha = 0; sTestDot.hidden = YES;
+            });
+        }
+    });
+}
+
+static void PTTestTap(CGPoint p, BOOL doubleTap) {
+    UIWindow *w = [UIApplication sharedApplication].keyWindow;
+    if (!w) return;
+    PTTestShowDot(p, p, NO, 0);
+    NSInteger pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:p withTouchPhase:UITouchPhaseBegan];
+    usleep(30000);
+    [PTFakeMetaTouch fakeTouchId:pid AtPoint:p withTouchPhase:UITouchPhaseEnded];
+    if (doubleTap) {
+        usleep(120000);
+        PTTestShowDot(p, p, NO, 0);
+        NSInteger pid2 = [PTFakeMetaTouch fakeTouchId:1 AtPoint:p withTouchPhase:UITouchPhaseBegan];
+        usleep(30000);
+        [PTFakeMetaTouch fakeTouchId:pid2 AtPoint:p withTouchPhase:UITouchPhaseEnded];
+    }
+}
+
+static float PTTestGetVolume(void) {
+    @try {
+        id c = [NSClassFromString(@"AVSystemController") performSelector:NSSelectorFromString(@"sharedAVSystemController")];
+        id v = [c performSelector:NSSelectorFromString(@"getVolumeForCategory:") withObject:@"AVAudioSessionCategoryAmbient"];
+        return v ? [v floatValue] : 0.5f;
+    } @catch (NSException *e) { return 0.5f; }
+}
+
+static void PTTestSetVolume(float v) {
+    @try {
+        id c = [NSClassFromString(@"AVSystemController") performSelector:NSSelectorFromString(@"sharedAVSystemController")];
+        [c performSelector:NSSelectorFromString(@"setVolumeTo:forCategory:") withObject:@(v) withObject:@"AVAudioSessionCategoryAmbient"];
+        [c performSelector:NSSelectorFromString(@"setVolumeTo:") withObject:@(v)];
+    } @catch (NSException *e) {}
+}
+
+// 执行单条动作 → 完成后 next()
+static void PTTestRunAction(NSDictionary *a, void (^next)(void)) {
+    NSString *type = a[@"type"];
+    if ([type isEqualToString:@"tap"]) {
+        CGPoint p = CGPointMake([a[@"x"] doubleValue], [a[@"y"] doubleValue]);
+        PTTestTap(p, NO);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
+    } else if ([type isEqualToString:@"doubleTap"]) {
+        CGPoint p = CGPointMake([a[@"x"] doubleValue], [a[@"y"] doubleValue]);
+        PTTestTap(p, YES);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
+    } else if ([type isEqualToString:@"swipe"]) {
+        CGPoint from = CGPointMake([a[@"x1"] doubleValue], [a[@"y1"] doubleValue]);
+        CGPoint to = CGPointMake([a[@"x2"] doubleValue], [a[@"y2"] doubleValue]);
+        double speed = [a[@"speed"] doubleValue] ?: 1000;
+        double distT = hypot(to.x - from.x, to.y - from.y);
+        double durMs = (distT / MAX(speed, 1.0)) * 1000.0;
+        if (durMs < 50) durMs = 50;
+        int holdMs = [a[@"holdMs"] intValue] ?: 20;
+        int liftMs = [a[@"liftMs"] intValue] ?: 0;
+        BOOL noInertia = a[@"noInertia"] ? [a[@"noInertia"] boolValue] : YES;
+        PTTestShowDot(from, to, YES, durMs / 1000.0);
+        double durSec = MAX(durMs / 1000.0, 0.001);
+        __block NSInteger pid = -1;
+        __block void (^stillAt)(CGPoint, int);
+        stillAt = ^(CGPoint pos, int ms) {
+            __block int n = MAX(ms, 0) / 16;
+            __block void (^still)(void);
+            still = ^(void) {
+                if (n <= 0) {
+                    [PTFakeMetaTouch fakeTouchId:pid AtPoint:pos withTouchPhase:UITouchPhaseEnded];
+                    if (next) next();
+                    return;
+                }
+                n--;
+                [PTFakeMetaTouch fakeTouchId:pid AtPoint:pos withTouchPhase:UITouchPhaseMoved];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(16 * NSEC_PER_SEC / 1000)), dispatch_get_main_queue(), still);
+            };
+            still();
+        };
+        __block CFAbsoluteTime t0;
+        __block void (^step)(void);
+        step = ^(void) {
+            double t = MIN((CFAbsoluteTimeGetCurrent() - t0) / durSec, 1.0);
+            if (t >= 1.0) {
+                if (noInertia) {
+                    stillAt(to, MAX(liftMs, 300));
+                } else {
+                    if (liftMs > 0) {
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(liftMs * NSEC_PER_SEC / 1000)), dispatch_get_main_queue(), ^{
+                            [PTFakeMetaTouch fakeTouchId:pid AtPoint:to withTouchPhase:UITouchPhaseEnded];
+                            if (next) next();
+                        });
+                    } else {
+                        [PTFakeMetaTouch fakeTouchId:pid AtPoint:to withTouchPhase:UITouchPhaseEnded];
+                        if (next) next();
+                    }
+                }
+                return;
+            }
+            CGPoint pp = CGPointMake(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
+            [PTFakeMetaTouch fakeTouchId:pid AtPoint:pp withTouchPhase:UITouchPhaseMoved];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(16 * NSEC_PER_SEC / 1000)), dispatch_get_main_queue(), step);
+        };
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(40 * NSEC_PER_SEC / 1000)), dispatch_get_main_queue(), ^{
+            pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:from withTouchPhase:UITouchPhaseBegan];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((holdMs + 20) * NSEC_PER_SEC / 1000)), dispatch_get_main_queue(), ^{
+                t0 = CFAbsoluteTimeGetCurrent();
+                step();
+            });
+        });
+    } else if ([type isEqualToString:@"delay"]) {
+        double ms = [a[@"ms"] doubleValue] ?: 100;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ms / 1000.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
+    } else if ([type isEqualToString:@"volumeUp"]) {
+        PTTestSetVolume(MIN(1.0, PTTestGetVolume() + 0.0625));
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
+    } else if ([type isEqualToString:@"volumeDown"]) {
+        PTTestSetVolume(MAX(0.0, PTTestGetVolume() - 0.0625));
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
+    } else if ([type isEqualToString:@"muteToggle"]) {
+        static float sTestMuted = -1;
+        if (sTestMuted < 0) { sTestMuted = PTTestGetVolume(); PTTestSetVolume(0); }
+        else { PTTestSetVolume(sTestMuted); sTestMuted = -1; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
+    } else {
+        if (next) next();
+    }
+}
+
+// 顺序执行方案动作序列（测试防抖 300ms；执行中同样忽略）
+static void PTTestExecPlan(NSString *name) {
+    double now = PTNowC();
+    if (sTestInjecting || now - sLastTestExec < 0.3) { PTDylibLog(@"[测试] 防抖：忽略 %@", name); return; }
+    sLastTestExec = now;
+    NSDictionary *plan = nil;
+    for (NSDictionary *p in PTDylibReadCfg()[@"plans"] ?: @[]) if ([p[@"name"] isEqualToString:name]) { plan = p; break; }
+    if (!plan) return;
+    NSArray *actions = plan[@"actions"] ?: @[];
+    if (!actions.count) { PTDylibLog(@"[测试] %@ 无动作，跳过", name); return; }
+    PTDylibLog(@"[测试] 命中「%@」，执行 %lu 条动作", name, (unsigned long)actions.count);
+    sTestInjecting = YES;
+    __block int idx = 0;
+    __block void (^runNext)(void);
+    runNext = ^(void) {
+        if (idx >= (int)actions.count) { sTestInjecting = NO; PTDylibLog(@"[测试] %@ 序列完成", name); return; }
+        NSDictionary *a = actions[idx++];
+        PTTestRunAction(a, runNext);
+    };
+    runNext();
+}
+
+// 测试模式：Ended 结算 → 匹配 → 执行
+void PTTestOnEnded(int phase, double dir, double dist, uint64_t sender, int tapDx) {
+    NSString *plan = PTTestMatchFeature(phase, dir, dist, sender, tapDx);
+    if (plan) {
+        PTDylibLog(@"[测试] 特征匹配 → 方案「%@」", plan);
+        PTTestExecPlan(plan);
+        NSDictionary *pp = nil;
+        for (NSDictionary *p in PTDylibReadCfg()[@"plans"] ?: @[]) if ([p[@"name"] isEqualToString:plan]) { pp = p; break; }
+        if ([sTestLogSink respondsToSelector:@selector(appendLog:)]) {
+            [sTestLogSink appendLog:[NSString stringWithFormat:@"✓ 命中「%@」→ 映射 %lu 条动作（sender=0x%llx phase=%d dir=%.1f dist=%.1f tapDx=%d）",
+                plan, (unsigned long)(pp[@"actions"] ? [pp[@"actions"] count] : 0), sender, phase, dir, dist, tapDx]];
+        }
+    } else {
+        PTDylibLog(@"[测试] 未匹配：sender=0x%llx phase=%d dir=%.1f dist=%.1f tapDx=%d", sender, phase, dir, dist, tapDx);
+        if ([sTestLogSink respondsToSelector:@selector(appendLog:)]) {
+            [sTestLogSink appendLog:[NSString stringWithFormat:@"✗ 未命中（放行）：sender=0x%llx phase=%d dir=%.1f dist=%.1f tapDx=%d",
+                sender, phase, dir, dist, tapDx]];
+        }
+        if ([sTestLogSink respondsToSelector:@selector(drawTrailWithDirection:dist:phase:)]) {
+            [sTestLogSink drawTrailWithDirection:dir dist:dist phase:phase];
+        }
+    }
+}
+
+// ============================================================
+// 特征结构 + 触摸会话（运行拦截）
+// ============================================================
+typedef struct {
+    int phase;        // 0=tap 1=swipe
+    double direction;
+    double dist;
+    int tapDx;
+} PagerFeature;
+
+static void PTExecutePlan(NSString *name);
+static NSString *PTMatchPlan(PagerFeature f, uint64_t sender);
+
+typedef struct {
+    BOOL active;
+    int nEvents;
+    CGPoint start, last;
+    double totalDist;
+    double firstMoveDir;
+    BOOL hasMove;
+} PagerSession;
+static PagerSession gSession;
+static NSMutableArray *gSessTrail = nil;
+
+static uint64_t gCurSender = 0;
+static double gPagerWindowUntil = 0;
+
+static BOOL PTIsLearnedSender(uint64_t s) {
+    for (int i = 0; i < gLearnedSenderCount; i++) if (gLearnedSenders[i] == s) return YES;
+    return NO;
+}
+
+static void PTReplayTrailAsync(void);
+
+// 匹配：sender + 相位 + 方向±15° + 位移区间 → 唯一方案
+static NSString *PTMatchPlan(PagerFeature f, uint64_t sender) {
+    NSString *best = nil;
+    double bestScore = DBL_MAX;
+    for (NSString *name in gPlans) {
+        NSDictionary *p = gPlans[name];
+        NSArray *fts = p[@"features"] ?: (p[@"feature"] ? @[p[@"feature"]] : @[]);
+        for (NSDictionary *ft in fts) {
+            if (ft[@"sender"]) {
+                unsigned long long s = 0;
+                NSScanner *sc = [NSScanner scannerWithString:ft[@"sender"]];
+                if (![sc scanHexLongLong:&s] || s != sender) continue;
+            }
+            if ([ft[@"phase"] intValue] != f.phase) continue;
+            double pd = [ft[@"direction"] doubleValue];
+            double d = fabs(fabs(f.direction - pd)); if (d > 180) d = 360 - d;
+            if (d > kDirTolerance) continue;
+            double lo = 0, hi = 0;
+            if (f.phase == 1) {
+                lo = [ft[@"distMin"] doubleValue];
+                hi = [ft[@"distMax"] doubleValue];
+                if (f.dist < lo - kDistSlack || f.dist > hi + kDistSlack) continue;
+            } else {
+                if (ft[@"tapDx"]) {
+                    if (f.tapDx != [ft[@"tapDx"] intValue]) continue;
+                }
+                if (ft[@"distMin"]) {
+                    lo = [ft[@"distMin"] doubleValue];
+                    hi = [ft[@"distMax"] doubleValue];
+                    if (f.dist < lo - kTapDistSlack || f.dist > hi + kTapDistSlack) continue;
+                }
+            }
+            double score = d + (f.phase == 1 ? fabs(f.dist - (lo + hi) / 2.0) / 100.0 : 0);
+            if (score < bestScore) { bestScore = score; best = name; }
+        }
+    }
+    return best;
+}
+
+// 返回 YES = 吞（命中：防 App 同时收到翻页器滚动）；NO = 放行
+static BOOL PTHandlePagerEvent(UIEvent *event) {
+    if (![event respondsToSelector:@selector(allTouches)]) return NO;
+    if (!PTIsLearnedSender(gCurSender)) return NO;
+    NSSet *touches = event.allTouches;
+    if (!touches.count) return NO;
+    UITouch *t = [touches anyObject];
+    CGPoint p = t.window ? [t locationInView:t.window] : [t locationInView:t.view];
+    switch (t.phase) {
+        case UITouchPhaseBegan: {
+            gSession.active = YES;
+            gSession.nEvents = 0;
+            gSession.start = p;
+            gSession.last = p;
+            gSession.totalDist = 0;
+            gSession.hasMove = NO;
+            gSession.firstMoveDir = 0;
+            gSessTrail = [NSMutableArray arrayWithObject:[NSValue valueWithCGPoint:p]];
+            return YES;
+        }
+        case UITouchPhaseMoved: {
+            if (!gSession.active) return NO;
+            gSession.nEvents++;
+            double dx = p.x - gSession.last.x, dy = p.y - gSession.last.y;
+            double seg = hypot(dx, dy);
+            if (seg > 0) {
+                gSession.totalDist += seg;
+                if (!gSession.hasMove && gSession.totalDist > 5) {
+                    gSession.hasMove = YES;
+                    gSession.firstMoveDir = atan2(dy, dx) * 180.0 / M_PI;
+                }
+            }
+            gSession.last = p;
+            if (gSessTrail && gSessTrail.count < 64) [gSessTrail addObject:[NSValue valueWithCGPoint:p]];
+            return YES;
+        }
+        case UITouchPhaseEnded: {
+            if (!gSession.active) return NO;
+            gSession.active = NO;
+            if (gSessTrail && gSessTrail.count < 64) [gSessTrail addObject:[NSValue valueWithCGPoint:p]];
+            PagerFeature f;
+            f.phase = (gSession.totalDist < kTapDistThreshold) ? 0 : 1;
+            f.direction = gSession.hasMove ? gSession.firstMoveDir : 0;
+            f.dist = gSession.totalDist;
+            {
+                double sx = gSession.start.x, ex = p.x;
+                double dxv = ex - sx;
+                f.tapDx = (dxv > kTapDxThresh) ? 1 : (dxv < -kTapDxThresh ? -1 : 0);
+            }
+            NSString *plan = PTMatchPlan(f, gCurSender);
+            if (plan) {
+                gSessTrail = nil;
+                PTDylibLog(@"[会话] 命中「%@」→ 执行映射（原始滑动已整段吞掉）", plan);
+                PTExecutePlan(plan);
+                return YES;
+            }
+            PTDylibLog(@"[会话] 未命中：sender=0x%llx phase=%d dir=%.1f dist=%.1f → 重放轨迹放行",
+                gCurSender, f.phase, f.direction, f.dist);
+            PTReplayTrailAsync();
+            return YES;
+        }
+        case UITouchPhaseCancelled:
+            gSession.active = NO;
+            gSessTrail = nil;
+            return NO;
+        default:
+            return NO;
+    }
+}
+
+// ============================================================
+// 调试可视化（绿点 + 轨迹；只画 App 实际收到的触摸）
+// ============================================================
+@interface PTDebugDot : NSObject
+@property (nonatomic) CGPoint pos;
+@property (nonatomic) BOOL pager;
+@property (nonatomic, strong) UIView *dotView;
+@property (nonatomic, strong) CAShapeLayer *trailLayer;
+@property (nonatomic, strong) NSMutableArray *trail;
+@end
+@implementation PTDebugDot
+- (instancetype)initWithPoint:(CGPoint)p pager:(BOOL)pg window:(UIWindow *)w {
+    self = [super init];
+    if (self) {
+        _pos = p; _pager = pg;
+        _trail = [NSMutableArray array];
+        [_trail addObject:[NSValue valueWithCGPoint:p]];
+        _dotView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 44, 44)];
+        _dotView.center = p;
+        _dotView.layer.cornerRadius = 22;
+        _dotView.layer.borderWidth = 2;
+        _dotView.layer.borderColor = [UIColor colorWithRed:0 green:0 blue:0 alpha:0.8].CGColor;
+        _dotView.backgroundColor = [UIColor colorWithRed:0.2 green:0.95 blue:0.3 alpha:0.85];
+        if (pg) {
+            UILabel *lb = [[UILabel alloc] initWithFrame:_dotView.bounds];
+            lb.text = @"P";
+            lb.font = [UIFont boldSystemFontOfSize:20];
+            lb.textColor = [UIColor blackColor];
+            lb.textAlignment = NSTextAlignmentCenter;
+            [_dotView addSubview:lb];
+        }
+        _trailLayer = [CAShapeLayer layer];
+        _trailLayer.strokeColor = [UIColor colorWithRed:0.2 green:0.95 blue:0.3 alpha:0.7].CGColor;
+        _trailLayer.fillColor = [UIColor clearColor].CGColor;
+        _trailLayer.lineWidth = 4;
+        _trailLayer.lineCap = kCALineCapRound;
+        [w.layer addSublayer:_trailLayer];
+        [w addSubview:_dotView];
+    }
+    return self;
+}
+- (void)moveTo:(CGPoint)p {
+    _pos = p;
+    _dotView.center = p;
+    [_trail addObject:[NSValue valueWithCGPoint:p]];
+    if (_trail.count > 80) [_trail removeObjectAtIndex:0];
+    CGMutablePathRef path = CGPathCreateMutable();
+    BOOL first = YES;
+    for (NSValue *v in _trail) {
+        CGPoint q = v.CGPointValue;
+        if (first) { CGPathMoveToPoint(path, NULL, q.x, q.y); first = NO; }
+        else CGPathAddLineToPoint(path, NULL, q.x, q.y);
+    }
+    _trailLayer.path = path;
+    CGPathRelease(path);
+}
+- (void)fadeOut {
+    [_dotView.layer removeAllAnimations];
+    [UIView animateWithDuration:0.5 animations:^{
+        _dotView.alpha = 0.15;
+    } completion:^(BOOL f) {
+        [_dotView removeFromSuperview];
+    }];
+    CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
+    fade.toValue = @(0.0);
+    fade.duration = 0.5;
+    fade.removedOnCompletion = NO;
+    fade.fillMode = kCAFillModeForwards;
+    [_trailLayer addAnimation:fade forKey:@"fade"];
+}
+@end
+
+static UIWindow *gDotWindow = nil;
+static NSMutableDictionary *gDotViews = nil;
+
+static void PTDebugEnsureWindow(void) {
+    if (gDotWindow) return;
+    UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    w.windowLevel = UIWindowLevelStatusBar + 1;
+    w.userInteractionEnabled = NO;
+    w.backgroundColor = [UIColor clearColor];
+    UIViewController *vc = [[UIViewController alloc] init];
+    vc.view.backgroundColor = [UIColor clearColor];
+    w.rootViewController = vc;
+    w.hidden = NO;
+    gDotWindow = w;
+    gDotViews = [NSMutableDictionary dictionary];
+}
+
+static void PTDebugUpdate(void *touchPtr, CGPoint p, UITouchPhase phase, BOOL pager) {
+    if (!gDebugDots) return;
+    if (![NSThread isMainThread]) return;
+    PTDebugEnsureWindow();
+    NSString *key = [NSString stringWithFormat:@"%p", touchPtr];
+    PTDebugDot *dot = gDotViews[key];
+    if (phase == UITouchPhaseBegan) {
+        if (dot) return;
+        dot = [[PTDebugDot alloc] initWithPoint:p pager:pager window:gDotWindow];
+        gDotViews[key] = dot;
+    } else if (phase == UITouchPhaseMoved) {
+        if (dot) [dot moveTo:p];
+    } else if (phase == UITouchPhaseEnded || phase == UITouchPhaseCancelled) {
+        if (dot) {
+            [dot moveTo:p];
+            [dot fadeOut];
+            [gDotViews removeObjectForKey:key];
+        }
+    }
+}
+
+// ============================================================
+// 动作执行（PTFakeMetaTouch + AVSystemController）
+// ============================================================
+static BOOL gIsInjecting = NO;
+static BOOL gExecRunning = NO;
+static BOOL gInFakeTouch = NO;
+static int gExecToken = 0;
+static double gLastExec = 0;
+static float gMutedVolume = -1;
+
+// 未命中：暂存轨迹重放给 App
+static void PTReplayTrailAsync(void) {
+    if (!gSessTrail || gSessTrail.count < 2) { gSessTrail = nil; return; }
+    NSArray *pts = [gSessTrail copy];
+    gSessTrail = nil;
+    CGPoint from = [pts.firstObject CGPointValue];
+    CGPoint to = [pts.lastObject CGPointValue];
+    NSMutableArray *mids = [NSMutableArray array];
+    NSUInteger n = pts.count;
+    NSUInteger k = MIN(n - 2, 10u);
+    for (NSUInteger i = 0; i < k; i++) {
+        NSUInteger idx = 1 + (i * (n - 2)) / k;
+        if (idx >= n - 1) idx = n - 2;
+        [mids addObject:pts[idx]];
+    }
+    gIsInjecting = YES;
+    gInFakeTouch = YES;
+    NSInteger pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:from withTouchPhase:UITouchPhaseBegan];
+    gInFakeTouch = NO;
+    __block NSUInteger i = 0;
+    __block void (^step)(void);
+    step = ^(void) {
+        if (i >= mids.count) {
+            gInFakeTouch = YES;
+            [PTFakeMetaTouch fakeTouchId:pid AtPoint:to withTouchPhase:UITouchPhaseEnded];
+            gInFakeTouch = NO;
+            gIsInjecting = NO;
+            PTDylibLog(@"[重放] 未命中：原始轨迹已重放给 App（%lu 中间点）", (unsigned long)mids.count);
+            return;
+        }
+        gInFakeTouch = YES;
+        [PTFakeMetaTouch fakeTouchId:pid AtPoint:[mids[i] CGPointValue] withTouchPhase:UITouchPhaseMoved];
+        gInFakeTouch = NO;
+        i++;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.012 * NSEC_PER_SEC)), dispatch_get_main_queue(), step);
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.016 * NSEC_PER_SEC)), dispatch_get_main_queue(), step);
+}
+
+static float PTGetVolume(void) {
+    @try {
+        id c = [NSClassFromString(@"AVSystemController") performSelector:NSSelectorFromString(@"sharedAVSystemController")];
+        id v = [c performSelector:NSSelectorFromString(@"getVolumeForCategory:") withObject:@"AVAudioSessionCategoryAmbient"];
+        return v ? [v floatValue] : 0.5f;
+    } @catch (NSException *e) { return 0.5f; }
+}
+
+static void PTSetVolume(float v) {
+    @try {
+        id c = [NSClassFromString(@"AVSystemController") performSelector:NSSelectorFromString(@"sharedAVSystemController")];
+        [c performSelector:NSSelectorFromString(@"setVolumeTo:forCategory:") withObject:@(v) withObject:@"AVAudioSessionCategoryAmbient"];
+        [c performSelector:NSSelectorFromString(@"setVolumeTo:") withObject:@(v)];
+    } @catch (NSException *e) {}
+}
+
+// 点击（同步短阻塞）
+static void PTFakeTap(CGPoint p, int pressMs) {
+    UIWindow *w = [UIApplication sharedApplication].keyWindow;
+    if (!w) return;
+    gInFakeTouch = YES;
+    NSInteger pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:p withTouchPhase:UITouchPhaseBegan];
+    gInFakeTouch = NO;
+    usleep(pressMs * 1000);
+    gInFakeTouch = YES;
+    [PTFakeMetaTouch fakeTouchId:pid AtPoint:p withTouchPhase:UITouchPhaseEnded];
+    gInFakeTouch = NO;
+}
+
+// 滑动（异步分步；holdMs 按下停留，liftMs 弹起停留，noInertia 防惯性）
+static void PTFakeSwipeAsync(CGPoint from, CGPoint to, double durationMs, int holdMs, int liftMs, BOOL noInertia, int token, void (^done)(void)) {
+    double durSec = MAX(durationMs / 1000.0, 0.001);
+    __block NSInteger pid = -1;
+    __block BOOL began = NO;
+    __block BOOL ended = NO;
+    __block CGPoint lastP = from;
+    __block void (^abortEnd)(void);
+    __block void (^doEnd)(void);
+    abortEnd = ^{
+        if (ended) return;
+        ended = YES;
+        if (!began) { if (done) done(); return; }
+        gInFakeTouch = YES;
+        [PTFakeMetaTouch fakeTouchId:pid AtPoint:lastP withTouchPhase:UITouchPhaseEnded];
+        gInFakeTouch = NO;
+    };
+    doEnd = ^{
+        if (ended) { if (done) done(); return; }
+        ended = YES;
+        gInFakeTouch = YES;
+        [PTFakeMetaTouch fakeTouchId:pid AtPoint:lastP withTouchPhase:UITouchPhaseEnded];
+        gInFakeTouch = NO;
+        if (done) done();
+    };
+    __block void (^stillAt)(CGPoint, int);
+    stillAt = ^(CGPoint pos, int ms) {
+        __block int n = MAX(ms, 0) / 16;
+        __block void (^still)(void);
+        still = ^(void) {
+            if (token != gExecToken) { abortEnd(); if (done) done(); return; }
+            if (n <= 0) { doEnd(); return; }
+            n--;
+            lastP = pos;
+            gInFakeTouch = YES;
+            [PTFakeMetaTouch fakeTouchId:pid AtPoint:pos withTouchPhase:UITouchPhaseMoved];
+            gInFakeTouch = NO;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(16 * NSEC_PER_SEC / 1000)), dispatch_get_main_queue(), still);
+        };
+        still();
+    };
+    __block CFAbsoluteTime t0;
+    __block void (^step)(void);
+    step = ^(void) {
+        if (token != gExecToken) { abortEnd(); if (done) done(); return; }
+        double t = MIN((CFAbsoluteTimeGetCurrent() - t0) / durSec, 1.0);
+        if (t >= 1.0) {
+            if (noInertia) {
+                stillAt(to, MAX(liftMs, 300));
+            } else {
+                if (liftMs > 0) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(liftMs * NSEC_PER_SEC / 1000)), dispatch_get_main_queue(), ^{
+                        if (token != gExecToken) { abortEnd(); if (done) done(); return; }
+                        doEnd();
+                    });
+                } else {
+                    doEnd();
+                }
+            }
+            return;
+        }
+        CGPoint p = CGPointMake(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
+        lastP = p;
+        gInFakeTouch = YES;
+        [PTFakeMetaTouch fakeTouchId:pid AtPoint:p withTouchPhase:UITouchPhaseMoved];
+        gInFakeTouch = NO;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(16 * NSEC_PER_SEC / 1000)), dispatch_get_main_queue(), step);
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(40 * NSEC_PER_SEC / 1000)), dispatch_get_main_queue(), ^{
+        if (token != gExecToken) { if (done) done(); return; }
+        began = YES;
+        gInFakeTouch = YES;
+        pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:from withTouchPhase:UITouchPhaseBegan];
+        gInFakeTouch = NO;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((holdMs + 20) * NSEC_PER_SEC / 1000)), dispatch_get_main_queue(), ^{
+            t0 = CFAbsoluteTimeGetCurrent();
+            step();
+        });
+    });
+}
+
+// 执行单条动作 → 完成后 next()
+static void PTRunAction(NSDictionary *a, int token, void (^next)(void)) {
+    NSString *type = a[@"type"];
+    if ([type isEqualToString:@"tap"]) {
+        int pressMs = [a[@"pressMs"] intValue] ?: 30;
+        PTFakeTap(CGPointMake([a[@"x"] doubleValue], [a[@"y"] doubleValue]), pressMs);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
+    } else if ([type isEqualToString:@"doubleTap"]) {
+        CGPoint p = CGPointMake([a[@"x"] doubleValue], [a[@"y"] doubleValue]);
+        int pressMs = [a[@"pressMs"] intValue] ?: 30;
+        int gapMs = [a[@"gapMs"] intValue] ?: 120;
+        PTFakeTap(p, pressMs);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(gapMs * NSEC_PER_SEC / 1000)), dispatch_get_main_queue(), ^{
+            if (token != gExecToken) { if (next) next(); return; }
+            PTFakeTap(p, pressMs);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
+        });
+    } else if ([type isEqualToString:@"swipe"]) {
+        CGPoint from = CGPointMake([a[@"x1"] doubleValue], [a[@"y1"] doubleValue]);
+        CGPoint to = CGPointMake([a[@"x2"] doubleValue], [a[@"y2"] doubleValue]);
+        double speed = [a[@"speed"] doubleValue] ?: 1000;
+        int holdMs = [a[@"holdMs"] intValue] ?: 20;
+        int liftMs = [a[@"liftMs"] intValue] ?: 0;
+        BOOL noInertia = a[@"noInertia"] ? [a[@"noInertia"] boolValue] : YES;
+        double dist = hypot(to.x - from.x, to.y - from.y);
+        double durMs = (dist / MAX(speed, 1.0)) * 1000.0;
+        if (durMs < 50) durMs = 50;
+        PTFakeSwipeAsync(from, to, durMs, holdMs, liftMs, noInertia, token, next);
+    } else if ([type isEqualToString:@"delay"]) {
+        double ms = [a[@"ms"] doubleValue] ?: 100;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ms / 1000.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
+    } else if ([type isEqualToString:@"volumeUp"]) {
+        PTSetVolume(MIN(1.0, PTGetVolume() + 0.0625));
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
+    } else if ([type isEqualToString:@"volumeDown"]) {
+        PTSetVolume(MAX(0.0, PTGetVolume() - 0.0625));
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
+    } else if ([type isEqualToString:@"muteToggle"]) {
+        if (gMutedVolume < 0) { gMutedVolume = PTGetVolume(); PTSetVolume(0); }
+        else { PTSetVolume(gMutedVolume); gMutedVolume = -1; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
+    } else {
+        if (next) next();
+    }
+}
+
+// 执行方案动作序列（防抖：序列执行中或距上次执行 < 防抖间隔都忽略）
+static void PTExecutePlan(NSString *name) {
+    double now = PTNowC();
+    if (gExecRunning || (now - gLastExec < gDebounceMs / 1000.0)) {
+        PTDylibLog(@"[执行] 防抖：忽略 %@（执行中=%d，%.0fms 内已执行）", name, gExecRunning, gDebounceMs);
+        return;
+    }
+    gLastExec = now;
+    NSDictionary *p = gPlans[name];
+    NSArray *actions = p[@"actions"] ?: @[];
+    if (!actions.count) { PTDylibLog(@"[执行] %@ 无动作，跳过", name); return; }
+    gExecToken++;
+    int token = gExecToken;
+    gIsInjecting = YES;
+    gExecRunning = YES;
+    PTDylibLog(@"[执行] 命中 %@，开始动作序列（%lu 条）", name, (unsigned long)actions.count);
+    __block int idx = 0;
+    __block void (^runNext)(void);
+    runNext = ^(void) {
+        if (token != gExecToken) return;
+        if (idx >= (int)actions.count) { gIsInjecting = NO; gExecRunning = NO; PTDylibLog(@"[执行] %@ 序列完成", name); return; }
+        NSDictionary *a = actions[idx++];
+        PTRunAction(a, token, runNext);
+    };
+    runNext();
+}
+
+// ============================================================
+// 合并 hook（学习/测试采集 + 运行拦截，同一对方法）
+// ============================================================
+static IMP gOrigAddEvent = NULL;
+static IMP gOrigSendEvent = NULL;
+
+static void PTDylibAddEvent(id self, SEL _cmd, void *event) {
+    PTDylibLoadConfig(NO);
+    if (event && pGetSender && pGetType) {
+        uint32_t type = pGetType(event);
+        uint64_t sender = pGetSender(event);
+        if (type == 11) {
+            gCurSender = sender;      // 运行端
+            sCurSender = sender;      // 采集端
+            if (sCollectArmed || sTestArmed) sWindowUntil = PTNowC() + kCollectWindowSec;
+            if (PTIsLearnedSender(sender)) {
+                double dx = pGetFloat ? pGetFloat(event, 0x23) : 0;
+                double dy = pGetFloat ? pGetFloat(event, 0x24) : 0;
+                PTDylibLog(@"[addEvent] 已学 sender=0x%llx → 会话通道（HID 位移观察 dx=%.2f dy=%.2f）", sender, dx, dy);
+                gPagerWindowUntil = PTNowC() + kPagerWindowSec;
+            }
+        }
+    }
+    if (gOrigAddEvent) ((void (*)(id, SEL, void *))gOrigAddEvent)(self, _cmd, event);
+}
+
+static void PTDylibSendEvent(id self, SEL _cmd, UIEvent *event) {
+    PTDylibLoadConfig(NO);
+    // 注入触摸/执行中：放行（注入触摸没有 addEvent、sender 残留翻页器，走拦截会把映射触摸 Began 吞掉）
+    if (gInFakeTouch || gIsInjecting || sTestInjecting) {
+        if (gOrigSendEvent) ((void (*)(id, SEL, UIEvent *))gOrigSendEvent)(self, _cmd, event);
+        return;
+    }
+    // 学习/测试激活：只采集放行，不拦截（即使按的是已学 sender 也不吞）
+    if ((sCollectArmed || sTestArmed) && event && PTNowC() < sWindowUntil) {
+        NSSet *touches = [event respondsToSelector:@selector(allTouches)] ? event.allTouches : nil;
+        UITouch *t = [touches anyObject];
+        if (t && pGetSender) {
+            CGPoint p = t.window ? [t locationInView:t.window] : [t locationInView:t.view];
+            switch (t.phase) {
+                case UITouchPhaseBegan: {
+                    sSessActive = YES; sSessDist = 0; sSessHasMove = NO; sSessFirstDir = 0;
+                    sSessLast = p;
+                    sSessStart = p;
+                    break;
+                }
+                case UITouchPhaseMoved: {
+                    if (sSessActive) {
+                        double dx = p.x - sSessLast.x, dy = p.y - sSessLast.y;
+                        double seg = hypot(dx, dy);
+                        if (seg > 0) {
+                            sSessDist += seg;
+                            if (!sSessHasMove && sSessDist > 5) {
+                                sSessHasMove = YES;
+                                sSessFirstDir = atan2(dy, dx) * 180.0 / M_PI;
+                            }
+                        }
+                        sSessLast = p;
+                    }
+                    break;
+                }
+                case UITouchPhaseEnded: {
+                    if (sSessActive) {
+                        sSessActive = NO;
+                        int phase = (sSessDist < kTapDistThreshold) ? 0 : 1;
+                        double dir = sSessHasMove ? sSessFirstDir : 0;
+                        int tapDx = 0;
+                        {
+                            double dxv = p.x - sSessStart.x;
+                            tapDx = (dxv > kTapDxThresh) ? 1 : (dxv < -kTapDxThresh ? -1 : 0);
+                        }
+                        if (sTestArmed) PTTestOnEnded(phase, dir, sSessDist, sCurSender, tapDx);
+                        else SAppendSample(phase, dir, sSessDist, tapDx);
+                    }
+                    break;
+                }
+                case UITouchPhaseCancelled: sSessActive = NO; break;
+                default: break;
+            }
+        }
+        if (gOrigSendEvent) ((void (*)(id, SEL, UIEvent *))gOrigSendEvent)(self, _cmd, event);
+        return;
+    }
+    // 运行拦截：已学 sender 会话/窗口内 → 整段吞（命中执行/未命中重放），App 不收到原始触摸
+    if (event && (PTNowC() < gPagerWindowUntil || gSession.active)) {
+        if (PTHandlePagerEvent(event)) return;
+    }
+    // 调试可视化：只画 App 实际收到的触摸（被吞掉的翻页器原始轨迹不可见）
+    if (gDebugDots && event) {
+        for (UITouch *t in event.allTouches) {
+            CGPoint p = t.window ? [t locationInView:t.window] : [t locationInView:t.view];
+            PTDebugUpdate((__bridge void *)t, p, t.phase, NO);
+        }
+    }
+    // 诊断：非注入触摸会话 Began 打一行 sender
+    if (event) {
+        for (UITouch *t in event.allTouches) {
+            if (t.phase == UITouchPhaseBegan) {
+                CGPoint p = t.window ? [t locationInView:t.window] : [t locationInView:t.view];
+                PTDylibLog(@"[touch] sender=0x%llx phase=Began pos=(%.1f,%.1f)", gCurSender, p.x, p.y);
+            }
+        }
+    }
+    if (gOrigSendEvent) ((void (*)(id, SEL, UIEvent *))gOrigSendEvent)(self, _cmd, event);
+}
+
+// hook 装配（method_getImplementation + method_setImplementation，无 ellekit）
+void PTDylibInstallHooks(void) {
+    static dispatch_once_t on;
+    dispatch_once(&on, ^{
+        @autoreleasepool {
+            void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+            if (iokit) {
+                pGetType = (IOHIDEventGetType_t)dlsym(iokit, "IOHIDEventGetType");
+                pGetSender = (IOHIDEventGetSenderID_t)dlsym(iokit, "IOHIDEventGetSenderID");
+                pGetFloat = (IOHIDEventGetFloatValue_t)dlsym(iokit, "IOHIDEventGetFloatValue");
+            }
+            Class addCls = NSClassFromString(@"_UIUpdateHIDDigitizerInput");
+            SEL addSel = sel_registerName("addEvent:");
+            Method am = addCls ? class_getInstanceMethod(addCls, addSel) : NULL;
+            if (am) { gOrigAddEvent = method_getImplementation(am); method_setImplementation(am, (IMP)PTDylibAddEvent); }
+
+            Class appCls = NSClassFromString(@"UIApplication");
+            SEL sendSel = sel_registerName("sendEvent:");
+            Method sm = appCls ? class_getInstanceMethod(appCls, sendSel) : NULL;
+            if (sm) { gOrigSendEvent = method_getImplementation(sm); method_setImplementation(sm, (IMP)PTDylibSendEvent); }
+
+            BOOL ok = (gOrigAddEvent != NULL && gOrigSendEvent != NULL && pGetType != NULL && pGetSender != NULL);
+            PTDylibLog(@"PTDylibInstallHooks: ok=%d addEvent=%d sendEvent=%d getType=%d getSender=%d",
+                ok, gOrigAddEvent != NULL, gOrigSendEvent != NULL, pGetType != NULL, pGetSender != NULL);
+        }
+    });
+}

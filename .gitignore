@@ -1,0 +1,7 @@
+# build
+out/
+*.dylib
+*.deb
+*.tar
+*.o
+build/
