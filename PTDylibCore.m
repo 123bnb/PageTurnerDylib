@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.6）
+// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.7）
 //
 // 从 deb 版 PageTurner v1.0.43 移植：
 //   · Tweak.xm 的运行拦截/匹配/执行/可视化（去掉 Preferences 进程分支、总开关、
@@ -210,6 +210,7 @@ static double gConfigMtime = 0;
 static double gDebounceMs = 300;
 static BOOL gDebugDots = NO;
 static BOOL gDebugLogEnabled = YES;
+static void PTDebugDestroyWindow(void);     // v1.0.7：可视化窗口销毁（前向声明）
 static NSMutableDictionary *gPlans = nil;      // name -> dict
 static BOOL gLearnActive = NO;
 static uint64_t gLearnedSenders[kMaxLearnedSenders];
@@ -226,6 +227,9 @@ static void PTDylibLoadConfig(BOOL force) {
     double db = [gConfig[@"debounceMs"] doubleValue];
     gDebounceMs = (db > 0) ? db : 300;
     gDebugDots = [gConfig[@"debugDots"] boolValue];
+    // v1.0.7：可视化开关关掉 → 销毁绿点窗口（此前永驻，windowLevel 高于状态栏会接管
+    // 状态栏样式导致时间/信号电池颜色不再跟随 App）
+    if (!gDebugDots) PTDebugDestroyWindow();
     gDebugLogEnabled = (gConfig[@"debugLogEnabled"] == nil) ? YES : [gConfig[@"debugLogEnabled"] boolValue];
     gPlans = [NSMutableDictionary dictionary];
     gLearnedSenderCount = 0;
@@ -796,6 +800,29 @@ static BOOL PTHandlePagerEvent(UIEvent *event) {
 static UIWindow *gDotWindow = nil;
 static NSMutableDictionary *gDotViews = nil;
 
+// v1.0.7：插件覆盖窗口的状态栏样式透传——iOS 状态栏样式由最顶层窗口的 rootViewController
+// 决定，空白 VC 会接管状态栏导致颜色不再跟随 App（时间/信号电池变白）。透传当前 keyWindow 样式。
+@interface PTDylibOverlayVC : UIViewController
+@end
+@implementation PTDylibOverlayVC
+- (UIStatusBarStyle)preferredStatusBarStyle {
+    UIWindow *kw = [UIApplication sharedApplication].keyWindow;
+    UIViewController *r = kw.rootViewController;
+    if (r && r != self) {
+        @try { return [r preferredStatusBarStyle]; } @catch (NSException *e) {}
+    }
+    return UIStatusBarStyleDefault;
+}
+- (BOOL)prefersStatusBarHidden {
+    UIWindow *kw = [UIApplication sharedApplication].keyWindow;
+    UIViewController *r = kw.rootViewController;
+    if (r && r != self) {
+        @try { return [r prefersStatusBarHidden]; } @catch (NSException *e) {}
+    }
+    return NO;
+}
+@end
+
 static void PTDebugEnsureWindow(void) {
     if (gDotWindow) return;
     UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
@@ -807,12 +834,21 @@ static void PTDebugEnsureWindow(void) {
     if (kw && [w respondsToSelector:@selector(setWindowScene:)]) {
         @try { w.windowScene = kw.windowScene; } @catch (NSException *e) {}
     }
-    UIViewController *vc = [[UIViewController alloc] init];
+    PTDylibOverlayVC *vc = [[PTDylibOverlayVC alloc] init];
     vc.view.backgroundColor = [UIColor clearColor];
     w.rootViewController = vc;
     w.hidden = NO;
     gDotWindow = w;
     gDotViews = [NSMutableDictionary dictionary];
+}
+
+// v1.0.7：可视化开关关掉时销毁窗口（不再永驻影响状态栏）
+static void PTDebugDestroyWindow(void) {
+    if (!gDotWindow) return;
+    gDotWindow.hidden = YES;
+    [gDotWindow removeFromSuperview];
+    gDotWindow = nil;
+    gDotViews = nil;
 }
 
 static void PTDebugUpdate(void *touchPtr, CGPoint p, UITouchPhase phase, BOOL pager) {

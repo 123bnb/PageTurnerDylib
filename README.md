@@ -101,6 +101,7 @@ ldid -S PageTurnerDylib.dylib
 
 ## 版本记录
 
+- **v1.0.7**：状态栏颜色跟随 App 修复——可视化窗口/菜单窗口的 rootViewController 状态栏样式透传（不再接管状态栏导致时间/信号电池变白）；可视化开关关掉时销毁窗口（不再永驻）；三指手势监听 UIWindowDidBecomeKeyNotification，keyWindow 变化自动迁移（此前只在触发时迁移，手势留在旧窗口触发不了就永远自愈不了）。
 - **v1.0.6**：修复调试可视化无效——可视化画点移到 sendEvent 注入 return 之前（与 deb 对齐，未命中重放/动作注入也画点）；可视化窗口补 windowScene 绑定（iOS 13+ 多 scene）。
 - **v1.0.5**：删除音量动作类型（与 deb v1.0.48 同步）——音量+/音量-/静音切换整体删除（无音频会话 App 进程音量读取接口全假值，修四版无法稳定，止损）；旧配置里的音量动作执行时自动跳过。
 - **v1.0.3**：音量± 读真实系统音量修复（与 deb v1.0.46 同步）——读改走 AVAudioSession.outputVolume（AVSystemController get 在 App 进程恒 0.5 默认，导致首次从 50% 起步、手动调音量不感知）；删持久目标状态，每次现读真实值再 ±0.0625。
