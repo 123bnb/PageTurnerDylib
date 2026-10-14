@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.3）
+// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.4）
 //
 // 从 deb 版 PageTurner v1.0.43 移植：
 //   · Tweak.xm 的运行拦截/匹配/执行/可视化（去掉 Preferences 进程分支、总开关、
@@ -469,26 +469,45 @@ static float PTReadVolumeViaCategory(void) {
     } @catch (NSException *e) { return 0.5f; }
 }
 
-// v1.0.3（与 deb v1.0.46 同步）：读真实系统音量——AVSystemController getVolumeForCategory
-// 在第三方 App 进程读不到真实值（恒 0.5 默认）→ 改用 AVAudioSession.outputVolume（系统
-// 公开接口，返回真实当前输出音量 0~1，跨进程可靠，手动调整自动感知）。失败回退
-// AVSystemController 候选 get，再失败返回 -1。
+// v1.0.4（与 deb v1.0.47 同步）：读真实系统音量——v1.0.3 实测 AVAudioSession.outputVolume
+// 与 AVSystemController getVolumeForCategory 在第三方 App 进程（无激活音频会话）都恒返回
+// 假 0.5 → 改用 MPVolumeView 私有 UISlider.value：系统音量控件，内部经 MediaRemote 绑定
+// 全局媒体音量，不依赖 App 音频会话。返回优先级：slider → outputVolume → AVSystemController → -1。
+// 附诊断日志：每次读把三种读法的值都打出来，实测后确认哪个是真实值。
 static float PTGetVolumeRealEx(void) {
+    float sliderV = -1, outV = -1, avsysV = -1;
+    @try {
+        if ([NSThread isMainThread]) {
+            UIView *vv = [[NSClassFromString(@"MPVolumeView") alloc] init];
+            if (vv) {
+                for (UIView *sv in [vv subviews]) {
+                    if ([sv isKindOfClass:[UISlider class]]) {
+                        float v = [(UISlider *)sv value];
+                        if (v >= 0 && v <= 1.0001f) { sliderV = v; break; }
+                    }
+                }
+            }
+        }
+    } @catch (NSException *e) {}
     @try {
         float v = [AVAudioSession sharedInstance].outputVolume;
-        if (v >= 0 && v <= 1.0001f) return v;
+        if (v >= 0 && v <= 1.0001f) outV = v;
     } @catch (NSException *e) {}
     @try {
         id c = [NSClassFromString(@"AVSystemController") performSelector:NSSelectorFromString(@"sharedAVSystemController")];
         for (NSString *cat in PTVolumeCategories()) {
             id v = [c performSelector:NSSelectorFromString(@"getVolumeForCategory:") withObject:cat];
-            if (v && [v floatValue] >= 0 && [v floatValue] <= 1.0001f) return [v floatValue];
+            if (v && [v floatValue] >= 0 && [v floatValue] <= 1.0001f) { avsysV = [v floatValue]; break; }
         }
-        return -1;
-    } @catch (NSException *e) { return -1; }
+    } @catch (NSException *e) {}
+    PTDylibLog(@"[音量] 读 slider=%.2f output=%.2f avsys=%.2f → 采用 %.2f",
+              sliderV, outV, avsysV, (sliderV >= 0) ? sliderV : ((outV >= 0) ? outV : avsysV));
+    if (sliderV >= 0) return sliderV;
+    if (outV >= 0) return outV;
+    return avsysV;
 }
 
-// v1.0.3：音量± 步进（测试区与运行端共用）——每次现读真实值再 ±0.0625，
+// v1.0.4：音量± 步进（测试区与运行端共用）——每次现读真实值再 ±0.0625，
 // 不再保留持久目标状态（手动调音量后自动感知；首次不再从 0.5 兜底起步）
 static float PTVolumeStep(BOOL up) {
     float base = PTGetVolumeRealEx();

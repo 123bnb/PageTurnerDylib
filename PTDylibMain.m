@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibMain.m —— PageTurnerDylib 入口（v1.0.3）
+// PTDylibMain.m —— PageTurnerDylib 入口（v1.0.4）
 //
 // 注入即生效：constructor → 主队列安装 hook → keyWindow 装三指长按手势。
 // 三指长按 0.5s → 弹出独立覆盖窗口（UINavigationController 包主菜单），
@@ -108,7 +108,7 @@ static void PTDylibInit(void) {
                 NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"?";
                 PTDylibInstallHooks();
                 PTDylibLog(@"==================================================");
-                PTDylibLog(@"PageTurnerDylib v1.0.3 已注入 %@ (pid=%d) 配置来源=%@",
+                PTDylibLog(@"PageTurnerDylib v1.0.4 已注入 %@ (pid=%d) 配置来源=%@",
                     bid, getpid(), PTDylibUsingDebConfig() ? @"复用deb配置" : @"独立配置");
                 PTDylibLog(@"配置路径=%@ 防抖=%.0fms 方案数=%lu",
                     PTDylibCfgPath(),
