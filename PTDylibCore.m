@@ -834,7 +834,7 @@ static void PTDebugDestroyOverlay(void) {
 }
 
 // v1.0.12：keyWindow 变化时把覆盖层迁到新窗口（旧覆盖层移除重建）
-static void PTDebugMigrateOverlay(void) {
+void PTDebugMigrateOverlay(void) {
     if (!gDotOverlay) return;
     UIWindow *kw = [UIApplication sharedApplication].keyWindow;
     if (!kw) return;
