@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.8）
+// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.9）
 //
 // 从 deb 版 RootListController.m（v1.0.43）移植，改造：
 //   · 基类 PSViewController/PSListController → UIViewController（不依赖 Preferences 框架）
@@ -180,7 +180,7 @@ static const double kConverge = 60.0;
 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
     if (s == 2) {
-        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.8\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，三指长按弹出本菜单。\n当前配置：%@",
+        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.9\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，三指长按弹出本菜单。\n当前配置：%@",
             PTDylibUsingDebConfig()
                 ? @"复用 deb 版配置（com.yourname.pageturner.plist），与 deb 插件数据互通"
                 : @"独立配置（未检测到 deb 配置，自建 com.yourname.pageturnerdylib.plist）"];
@@ -1441,8 +1441,8 @@ static const double kConverge = 60.0;
 
 // ============================================================
 // 滑动(手动)录制页（v1.0.8）
-// 顶部提示条+完成按钮行往下才是录制区；手指在录制区按下开始录，抬起结束；
-// 每次录完显示点数，可重录，点「完成」保存为 recSwipe 动作
+// 顶部按钮行往下才是录制区；手指在录制区按下开始录，抬起结束；
+// 提示字放录制区中心当背景字（v1.0.9：不被灵动岛遮挡，不拦截滑动）
 // ============================================================
 @implementation PTRecordVC
 
@@ -1456,27 +1456,34 @@ static const double kConverge = 60.0;
     if (self.navigationController.interactivePopGestureRecognizer) {
         self.navigationController.interactivePopGestureRecognizer.enabled = NO;
     }
-    CGFloat w = self.view.bounds.size.width;
-    self.tip = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, w - 32, 44)];
+    // v1.0.9：提示字放录制区中心当背景字（不被灵动岛遮挡），自动换行、不拦截滑动
+    CGFloat w = self.view.bounds.size.width, h = self.view.bounds.size.height;
+    CGFloat tw = w - 56, th = 180;
+    self.tip = [[UILabel alloc] initWithFrame:CGRectMake((w - tw) / 2.0, (h - th) / 2.0, tw, th)];
     self.tip.text = @"在下方区域用手指滑动录制：按下→滑动→松开。\n松手后点右上角「完成」保存（再滑一次可重录）";
     self.tip.numberOfLines = 0;
-    self.tip.font = [UIFont systemFontOfSize:14];
-    self.tip.textColor = [UIColor secondaryLabelColor];
+    self.tip.textAlignment = NSTextAlignmentCenter;
+    self.tip.font = [UIFont systemFontOfSize:17];
+    self.tip.textColor = [UIColor labelColor];
+    self.tip.userInteractionEnabled = NO;   // 纯背景字，不拦截滑动
+    self.tip.backgroundColor = [UIColor secondarySystemBackgroundColor];
+    self.tip.layer.cornerRadius = 12;
+    self.tip.layer.masksToBounds = YES;
     [self.view addSubview:self.tip];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
-    // 录制区上边界 = 提示条（按钮行）下缘，转成窗口坐标
+    // 录制区上边界 = 顶部按钮行（导航栏+安全边 56pt）下缘，转成窗口坐标
     CGFloat w = self.view.bounds.size.width;
-    CGRect bar = CGRectMake(0, 0, w, 64);
+    CGRect bar = CGRectMake(0, 0, w, 56);
     CGRect wBar = [self.view convertRect:bar toView:self.view.window];
     __weak typeof(self) ws = self;
     PTRecStart(CGRectGetMaxY(wBar), ^(NSArray *pts) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!ws) return;
             ws.lastPts = pts;
-            ws.tip.text = [NSString stringWithFormat:@"已录 %lu 点 ✓  再滑一次可重录，点右上角「完成」保存",
+            ws.tip.text = [NSString stringWithFormat:@"已录 %lu 点 ✓\n再滑一次可重录，点右上角「完成」保存",
                 (unsigned long)pts.count];
         });
     });
