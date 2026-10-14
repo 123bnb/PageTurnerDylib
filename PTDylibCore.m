@@ -212,6 +212,7 @@ static BOOL gDebugDots = NO;
 static BOOL gDebugLogEnabled = YES;
 static void PTDebugDestroyOverlay(void);    // v1.0.12：可视化覆盖层销毁（前向声明）
 static void PTFakeRecSwipeAsync(NSArray *pts, int token, void (^done)(void));  // v1.0.13：测试区回放前向声明
+static int gExecToken;   // v1.0.13：前向声明（定义在运行拦截段，测试区 recSwipe 回放需要）
 static NSMutableDictionary *gPlans = nil;      // name -> dict
 static BOOL gLearnActive = NO;
 static uint64_t gLearnedSenders[kMaxLearnedSenders];
