@@ -36,7 +36,7 @@ jobs:
             -Wl,-undefined,dynamic_lookup \
             -Wno-unused-variable -Wno-deprecated-declarations -Wno-arc-performSelector-leaks \
             -Iptftouch -include ptftouch/Compat.h \
-            -framework Foundation -framework UIKit \
+            -framework Foundation -framework UIKit -framework AVFoundation \
             -dynamiclib $SRCS -o out/PageTurnerDylib.dylib \
             && echo "编译 OK (arm64+arm64e)" \
             || { echo "arm64+arm64e 失败, 尝试只 arm64"; \
@@ -45,7 +45,7 @@ jobs:
                    -Wl,-undefined,dynamic_lookup \
                    -Wno-unused-variable -Wno-deprecated-declarations -Wno-arc-performSelector-leaks \
                    -Iptftouch -include ptftouch/Compat.h \
-                   -framework Foundation -framework UIKit \
+                   -framework Foundation -framework UIKit -framework AVFoundation \
                    -dynamiclib $SRCS -o out/PageTurnerDylib.dylib \
                    && echo "编译 OK (仅arm64)"; }
           file out/PageTurnerDylib.dylib

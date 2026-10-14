@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.2）
+// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.3）
 //
 // 从 deb 版 PageTurner v1.0.43 移植：
 //   · Tweak.xm 的运行拦截/匹配/执行/可视化（去掉 Preferences 进程分支、总开关、
@@ -17,6 +17,7 @@
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <AVFoundation/AVFoundation.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
@@ -468,27 +469,31 @@ static float PTReadVolumeViaCategory(void) {
     } @catch (NSException *e) { return 0.5f; }
 }
 
-// v1.0.2（与 deb v1.0.45 同步）：音量±目标值状态——不依赖 get 回读（第三方 App 里
-// getVolumeForCategory 不可靠，恒 0.5 兜底 → 旧写法目标值每次相同 → 二次按键音量不变）
-static float gVolumeTarget = -1;   // -1=未初始化
-
-// 真实音量回读（失败返回 -1，区别于 0.5 兜底）——用于初始化音量±目标状态
+// v1.0.3（与 deb v1.0.46 同步）：读真实系统音量——AVSystemController getVolumeForCategory
+// 在第三方 App 进程读不到真实值（恒 0.5 默认）→ 改用 AVAudioSession.outputVolume（系统
+// 公开接口，返回真实当前输出音量 0~1，跨进程可靠，手动调整自动感知）。失败回退
+// AVSystemController 候选 get，再失败返回 -1。
 static float PTGetVolumeRealEx(void) {
+    @try {
+        float v = [AVAudioSession sharedInstance].outputVolume;
+        if (v >= 0 && v <= 1.0001f) return v;
+    } @catch (NSException *e) {}
     @try {
         id c = [NSClassFromString(@"AVSystemController") performSelector:NSSelectorFromString(@"sharedAVSystemController")];
         for (NSString *cat in PTVolumeCategories()) {
             id v = [c performSelector:NSSelectorFromString(@"getVolumeForCategory:") withObject:cat];
-            if (v) return [v floatValue];
+            if (v && [v floatValue] >= 0 && [v floatValue] <= 1.0001f) return [v floatValue];
         }
         return -1;
     } @catch (NSException *e) { return -1; }
 }
 
-// 音量± 步进（测试区与运行端共用）：返回本次目标值
+// v1.0.3：音量± 步进（测试区与运行端共用）——每次现读真实值再 ±0.0625，
+// 不再保留持久目标状态（手动调音量后自动感知；首次不再从 0.5 兜底起步）
 static float PTVolumeStep(BOOL up) {
-    if (gVolumeTarget < 0) { float real = PTGetVolumeRealEx(); gVolumeTarget = (real >= 0) ? real : 0.5f; }
-    gVolumeTarget = up ? MIN(1.0f, gVolumeTarget + 0.0625f) : MAX(0.0f, gVolumeTarget - 0.0625f);
-    return gVolumeTarget;
+    float base = PTGetVolumeRealEx();
+    if (base < 0) base = 0.5f;
+    return up ? MIN(1.0f, base + 0.0625f) : MAX(0.0f, base - 0.0625f);
 }
 
 // MPVolumeView 兜底：主队列异步建视图（加入 keyWindow 隐藏位），下一 runloop 遍历找 UISlider
@@ -528,7 +533,6 @@ static void PTSetVolumeEx(float v) {
             if ([r boolValue]) {
                 id nv = [c performSelector:NSSelectorFromString(@"getVolumeForCategory:") withObject:cat];
                 if (nv && fabs([nv floatValue] - v) < 0.01f) {
-                    gVolumeTarget = [nv floatValue];   // 回读确认成功 → 同步目标状态（防漂移）
                     PTDylibLog(@"[音量] %.2f ✓ AVSystemController(%@)", v, cat);
                     return;
                 }
@@ -628,7 +632,7 @@ static void PTTestRunAction(NSDictionary *a, void (^next)(void)) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
     } else if ([type isEqualToString:@"muteToggle"]) {
         static float sTestMuted = -1;
-        if (sTestMuted < 0) { sTestMuted = (gVolumeTarget >= 0) ? gVolumeTarget : ((PTGetVolumeRealEx() >= 0) ? PTGetVolumeRealEx() : 0.5f); PTTestSetVolume(0); }
+        if (sTestMuted < 0) { sTestMuted = PTGetVolumeRealEx(); if (sTestMuted < 0) sTestMuted = 0.5f; PTTestSetVolume(0); }
         else { PTTestSetVolume(sTestMuted); sTestMuted = -1; }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
     } else {
@@ -1124,7 +1128,7 @@ static void PTRunAction(NSDictionary *a, int token, void (^next)(void)) {
         PTSetVolume(PTVolumeStep(NO));
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
     } else if ([type isEqualToString:@"muteToggle"]) {
-        if (gMutedVolume < 0) { gMutedVolume = (gVolumeTarget >= 0) ? gVolumeTarget : ((PTGetVolumeRealEx() >= 0) ? PTGetVolumeRealEx() : 0.5f); PTSetVolume(0); }
+        if (gMutedVolume < 0) { gMutedVolume = PTGetVolumeRealEx(); if (gMutedVolume < 0) gMutedVolume = 0.5f; PTSetVolume(0); }
         else { PTSetVolume(gMutedVolume); gMutedVolume = -1; }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
     } else {
