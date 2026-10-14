@@ -101,7 +101,7 @@ ldid -S PageTurnerDylib.dylib
 
 ## 版本记录
 
-- **v1.0.4**：音量± 读取改 MPVolumeView slider（与 deb v1.0.47 同步）——v1.0.3 实测 outputVolume/AVSystemController 在无音频会话的 App 进程都恒返回假 0.5，slider 经 MediaRemote 绑定全局音量不依赖会话；日志打印三种读法值供实测确认。
+- **v1.0.5**：删除音量动作类型（与 deb v1.0.48 同步）——音量+/音量-/静音切换整体删除（无音频会话 App 进程音量读取接口全假值，修四版无法稳定，止损）；旧配置里的音量动作执行时自动跳过。
 - **v1.0.3**：音量± 读真实系统音量修复（与 deb v1.0.46 同步）——读改走 AVAudioSession.outputVolume（AVSystemController get 在 App 进程恒 0.5 默认，导致首次从 50% 起步、手动调音量不感知）；删持久目标状态，每次现读真实值再 ±0.0625。
 - **v1.0.2**：配置统一存 App 容器内（去掉 deb 5 候选路径探测 / jbroot 镜像推断 / 双写——TrollStore 注入无沙盒外权限，那些路径全部访问不到）；日志文件固定容器 Documents；音量± 与 deb v1.0.45 同步修复（目标值状态累加，不再依赖 get 回读，修"只能首次触发"）。
 - **v1.0.1**：音量修复（与 deb v1.0.44 同步）——静音/音量± 无效根因：AVSystemController 私有 category 字符串用错，现按候选 category 依次尝试 + 回读确认 + MPVolumeView slider 兜底。

@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.4）
+// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.5）
 //
 // 从 deb 版 RootListController.m（v1.0.43）移植，改造：
 //   · 基类 PSViewController/PSListController → UIViewController（不依赖 Preferences 框架）
@@ -161,7 +161,7 @@ static const double kConverge = 60.0;
 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
     if (s == 2) {
-        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.4\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，三指长按弹出本菜单。\n当前配置：%@",
+        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.5\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，三指长按弹出本菜单。\n当前配置：%@",
             PTDylibUsingDebConfig()
                 ? @"复用 deb 版配置（com.yourname.pageturner.plist），与 deb 插件数据互通"
                 : @"独立配置（未检测到 deb 配置，自建 com.yourname.pageturnerdylib.plist）"];
@@ -564,8 +564,16 @@ static const double kConverge = 60.0;
     if (ip.row < (NSInteger)self.actions.count) {
         NSDictionary *act = self.actions[ip.row];
         NSString *type = act[@"type"];
-        if (![type isEqualToString:@"delay"] && ![type isEqualToString:@"muteToggle"]
-            && ![type isEqualToString:@"volumeUp"] && ![type isEqualToString:@"volumeDown"]) {
+        // v1.0.5：已删除的音量动作（旧配置残留）→ 提示，不进编辑页
+        if ([type isEqualToString:@"volumeUp"] || [type isEqualToString:@"volumeDown"] || [type isEqualToString:@"muteToggle"]) {
+            UIAlertController *al = [UIAlertController alertControllerWithTitle:@"该动作已移除"
+                message:@"音量+/音量-/静音切换已在 v1.0.5 删除（注入环境音量读取不可靠）。请在编辑中删除这个动作，换成其它动作。"
+                preferredStyle:UIAlertControllerStyleAlert];
+            [al addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:al animated:YES completion:nil];
+            return;
+        }
+        if (![type isEqualToString:@"delay"]) {
             PTActionVC *vc = [PTActionVC new];
             vc.planName = self.planName;
             vc.actionType = type;
@@ -643,7 +651,7 @@ static const double kConverge = 60.0;
         message:@"选择要添加的动作" preferredStyle:UIAlertControllerStyleActionSheet];
     NSArray *items = @[
         @[@"点击", @"tap"], @[@"双击", @"doubleTap"], @[@"滑动", @"swipe"],
-        @[@"延迟", @"delay"], @[@"静音", @"muteToggle"], @[@"音量+", @"volumeUp"], @[@"音量-", @"volumeDown"]];
+        @[@"延迟", @"delay"]];   // v1.0.5：音量+/音量-/静音切换动作类型已删除
     for (NSArray *it in items) {
         [al addAction:[UIAlertAction actionWithTitle:it[0] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
             [self configAction:it[1]];
@@ -664,9 +672,6 @@ static const double kConverge = 60.0;
             if (ms > 0) { [self.actions addObject:@{@"type": @"delay", @"ms": @(ms)}]; [self saveActions]; }
         }]];
         [self presentViewController:al animated:YES completion:nil];
-    } else if ([type isEqualToString:@"volumeUp"] || [type isEqualToString:@"volumeDown"] || [type isEqualToString:@"muteToggle"]) {
-        [self.actions addObject:@{@"type": type}];
-        [self saveActions];
     } else {
         PTActionVC *vc = [PTActionVC new];
         vc.actionType = type;
