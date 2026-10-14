@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.12）
+// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.13）
 //
 // 从 deb 版 PageTurner v1.0.43 移植：
 //   · Tweak.xm 的运行拦截/匹配/执行/可视化（去掉 Preferences 进程分支、总开关、
@@ -211,6 +211,7 @@ static double gDebounceMs = 300;
 static BOOL gDebugDots = NO;
 static BOOL gDebugLogEnabled = YES;
 static void PTDebugDestroyOverlay(void);    // v1.0.12：可视化覆盖层销毁（前向声明）
+static void PTFakeRecSwipeAsync(NSArray *pts, int token, void (^done)(void));  // v1.0.13：测试区回放前向声明
 static NSMutableDictionary *gPlans = nil;      // name -> dict
 static BOOL gLearnActive = NO;
 static uint64_t gLearnedSenders[kMaxLearnedSenders];
@@ -541,6 +542,25 @@ static void PTTestRunAction(NSDictionary *a, void (^next)(void)) {
     } else if ([type isEqualToString:@"delay"]) {
         double ms = [a[@"ms"] doubleValue] ?: 100;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ms / 1000.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
+    } else if ([type isEqualToString:@"recSwipe"]) {
+        // v1.0.13：测试区支持滑动(手动)回放——此前缺分支被 else 跳过，注入轨迹看不到
+        PTFakeRecSwipeAsync(a[@"pts"], gExecToken, next);
+    } else if ([type isEqualToString:@"tapManual"]) {
+        NSArray *pts = a[@"pts"];
+        CGPoint p = pts.count ? CGPointMake([pts[0][@"x"] doubleValue], [pts[0][@"y"] doubleValue]) : CGPointMake(200, 400);
+        PTTestTap(p, NO);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
+    } else if ([type isEqualToString:@"doubleTapManual"]) {
+        NSArray *pts = a[@"pts"];
+        CGPoint p0 = pts.count >= 1 ? CGPointMake([pts[0][@"x"] doubleValue], [pts[0][@"y"] doubleValue]) : CGPointMake(200, 400);
+        CGPoint p1 = pts.count >= 2 ? CGPointMake([pts[1][@"x"] doubleValue], [pts[1][@"y"] doubleValue]) : p0;
+        double gapMs = (pts.count >= 2) ? ([pts[1][@"t"] doubleValue] - [pts[0][@"t"] doubleValue]) : 120.0;
+        if (gapMs < 40) gapMs = 40;
+        PTTestTap(p0, NO);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(gapMs / 1000.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            PTTestTap(p1, NO);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
+        });
     } else {
         // v1.0.5：音量+/音量-/静音切换已删除，旧配置里的这些动作在此跳过
         if (next) next();
