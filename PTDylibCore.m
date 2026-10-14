@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.0）
+// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.1）
 //
 // 从 deb 版 PageTurner v1.0.43 移植：
 //   · Tweak.xm 的运行拦截/匹配/执行/可视化（去掉 Preferences 进程分支、总开关、
@@ -519,20 +519,83 @@ static void PTTestTap(CGPoint p, BOOL doubleTap) {
     }
 }
 
-static float PTTestGetVolume(void) {
+// v1.0.1（音量修复）：静音/音量± 全部无效的根因 —— AVSystemController 的私有 category
+//   字符串用错（@"AVAudioSessionCategoryAmbient" 是 AVAudioSession 常量，AVSystemController
+//   识别的是 "Audio/global" 等私有字符串）→ setVolumeTo:forCategory: 静默返回 NO，音量不动。
+//   修复：① 候选 category 依次 set（Audio/global → Audio/ambient → 旧字符串兜底），
+//   ② set 后回读确认真正生效才返回；③ 全部失效走 MPVolumeView 私有 slider 兜底
+//   （2026 实测仍可用：init 后加入 keyWindow 隐藏位，遍历 subviews 拿 UISlider 直接设 value）。
+static NSArray *PTVolumeCategories(void) {
+    return @[@"Audio/global", @"Audio/ambient", @"AVAudioSessionCategoryAmbient"];
+}
+
+static float PTReadVolumeViaCategory(void) {
     @try {
         id c = [NSClassFromString(@"AVSystemController") performSelector:NSSelectorFromString(@"sharedAVSystemController")];
-        id v = [c performSelector:NSSelectorFromString(@"getVolumeForCategory:") withObject:@"AVAudioSessionCategoryAmbient"];
-        return v ? [v floatValue] : 0.5f;
+        for (NSString *cat in PTVolumeCategories()) {
+            id v = [c performSelector:NSSelectorFromString(@"getVolumeForCategory:") withObject:cat];
+            if (v) return [v floatValue];
+        }
+        return 0.5f;
     } @catch (NSException *e) { return 0.5f; }
 }
 
-static void PTTestSetVolume(float v) {
+// MPVolumeView 兜底：主队列异步建视图（加入 keyWindow 隐藏位），下一 runloop 遍历找 UISlider
+static void PTVolumeViaSlider(float v) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            UIView *vv = [[NSClassFromString(@"MPVolumeView") alloc] init];
+            UIWindow *w = [UIApplication sharedApplication].keyWindow;
+            if (!vv || !w) return;
+            vv.frame = CGRectMake(-100, -100, 10, 10);
+            [w addSubview:vv];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                @try {
+                    for (UIView *sv in [vv subviews]) {
+                        if ([sv isKindOfClass:[UISlider class]]) {
+                            [(UISlider *)sv setValue:v animated:NO];
+                            [(UISlider *)sv sendActionsForControlEvents:UIControlEventValueChanged];
+                            PTDylibLog(@"[音量] %.2f ✓ MPVolumeView slider 兜底生效", v);
+                            [vv removeFromSuperview];
+                            return;
+                        }
+                    }
+                    PTDylibLog(@"[音量] %.2f ✗ 未找到 volumeSlider（AVSystem 与 MPVolumeView 均失败）", v);
+                } @catch (NSException *e) {}
+                [vv removeFromSuperview];
+            });
+        } @catch (NSException *e) {}
+    });
+}
+
+// 设置音量：候选 category 依次 set + 回读确认；全部失败走 MPVolumeView slider 兜底
+static void PTSetVolumeEx(float v) {
     @try {
         id c = [NSClassFromString(@"AVSystemController") performSelector:NSSelectorFromString(@"sharedAVSystemController")];
-        [c performSelector:NSSelectorFromString(@"setVolumeTo:forCategory:") withObject:@(v) withObject:@"AVAudioSessionCategoryAmbient"];
-        [c performSelector:NSSelectorFromString(@"setVolumeTo:") withObject:@(v)];
-    } @catch (NSException *e) {}
+        for (NSString *cat in PTVolumeCategories()) {
+            NSNumber *r = [c performSelector:NSSelectorFromString(@"setVolumeTo:forCategory:") withObject:@(v) withObject:cat];
+            if ([r boolValue]) {
+                id nv = [c performSelector:NSSelectorFromString(@"getVolumeForCategory:") withObject:cat];
+                if (nv && fabs([nv floatValue] - v) < 0.01f) {
+                    PTDylibLog(@"[音量] %.2f ✓ AVSystemController(%@)", v, cat);
+                    return;
+                }
+            }
+        }
+        PTDylibLog(@"[音量] %.2f ⚠ AVSystemController 未生效，尝试 MPVolumeView 兜底", v);
+        PTVolumeViaSlider(v);
+    } @catch (NSException *e) {
+        PTDylibLog(@"[音量] %.2f ✗ 异常，尝试 MPVolumeView 兜底", v);
+        PTVolumeViaSlider(v);
+    }
+}
+
+static float PTTestGetVolume(void) {
+    return PTReadVolumeViaCategory();
+}
+
+static void PTTestSetVolume(float v) {
+    PTSetVolumeEx(v);
 }
 
 // 执行单条动作 → 完成后 next()
@@ -974,19 +1037,11 @@ static void PTReplayTrailAsync(void) {
 }
 
 static float PTGetVolume(void) {
-    @try {
-        id c = [NSClassFromString(@"AVSystemController") performSelector:NSSelectorFromString(@"sharedAVSystemController")];
-        id v = [c performSelector:NSSelectorFromString(@"getVolumeForCategory:") withObject:@"AVAudioSessionCategoryAmbient"];
-        return v ? [v floatValue] : 0.5f;
-    } @catch (NSException *e) { return 0.5f; }
+    return PTReadVolumeViaCategory();
 }
 
 static void PTSetVolume(float v) {
-    @try {
-        id c = [NSClassFromString(@"AVSystemController") performSelector:NSSelectorFromString(@"sharedAVSystemController")];
-        [c performSelector:NSSelectorFromString(@"setVolumeTo:forCategory:") withObject:@(v) withObject:@"AVAudioSessionCategoryAmbient"];
-        [c performSelector:NSSelectorFromString(@"setVolumeTo:") withObject:@(v)];
-    } @catch (NSException *e) {}
+    PTSetVolumeEx(v);
 }
 
 // 点击（同步短阻塞）

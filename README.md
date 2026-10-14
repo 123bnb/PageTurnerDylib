@@ -101,4 +101,5 @@ ldid -S PageTurnerDylib.dylib
 
 ## 版本记录
 
+- **v1.0.1**：音量修复（与 deb v1.0.44 同步）——静音/音量± 无效根因：AVSystemController 私有 category 字符串用错，现按候选 category 依次尝试 + 回读确认 + MPVolumeView slider 兜底。
 - **v1.0.0**：首个独立 dylib 版本。功能与 deb v1.0.43 对齐（防抖严谨化、可视化只画实际收到触摸、速度默认 1000pt/s、参数页预设值、映射排序、重复特征禁保存+清空、绿点解除钳制、底部版本号等）。
