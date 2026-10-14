@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.5）
+// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.6）
 //
 // 从 deb 版 PageTurner v1.0.43 移植：
 //   · Tweak.xm 的运行拦截/匹配/执行/可视化（去掉 Preferences 进程分支、总开关、
@@ -802,6 +802,11 @@ static void PTDebugEnsureWindow(void) {
     w.windowLevel = UIWindowLevelStatusBar + 1;
     w.userInteractionEnabled = NO;
     w.backgroundColor = [UIColor clearColor];
+    // v1.0.6：iOS 13+ 多 scene 环境绑定当前 keyWindow 的 scene，否则窗口可能不显示
+    UIWindow *kw = [UIApplication sharedApplication].keyWindow;
+    if (kw && [w respondsToSelector:@selector(setWindowScene:)]) {
+        @try { w.windowScene = kw.windowScene; } @catch (NSException *e) {}
+    }
     UIViewController *vc = [[UIViewController alloc] init];
     vc.view.backgroundColor = [UIColor clearColor];
     w.rootViewController = vc;
@@ -1065,6 +1070,14 @@ static void PTDylibAddEvent(id self, SEL _cmd, void *event) {
 
 static void PTDylibSendEvent(id self, SEL _cmd, UIEvent *event) {
     PTDylibLoadConfig(NO);
+    // v1.0.6：调试可视化先画点（与 deb 对齐——未命中重放/动作执行的注入触摸也画点；
+    // 被拦截吞掉的翻页器原始轨迹仍不可见，v1.0.43 语义不变）
+    if (gDebugDots && event) {
+        for (UITouch *t in event.allTouches) {
+            CGPoint p = t.window ? [t locationInView:t.window] : [t locationInView:t.view];
+            PTDebugUpdate((__bridge void *)t, p, t.phase, NO);
+        }
+    }
     // 注入触摸/执行中：放行（注入触摸没有 addEvent、sender 残留翻页器，走拦截会把映射触摸 Began 吞掉）
     if (gInFakeTouch || gIsInjecting || sTestInjecting) {
         if (gOrigSendEvent) ((void (*)(id, SEL, UIEvent *))gOrigSendEvent)(self, _cmd, event);
@@ -1123,13 +1136,6 @@ static void PTDylibSendEvent(id self, SEL _cmd, UIEvent *event) {
     // 运行拦截：已学 sender 会话/窗口内 → 整段吞（命中执行/未命中重放），App 不收到原始触摸
     if (event && (PTNowC() < gPagerWindowUntil || gSession.active)) {
         if (PTHandlePagerEvent(event)) return;
-    }
-    // 调试可视化：只画 App 实际收到的触摸（被吞掉的翻页器原始轨迹不可见）
-    if (gDebugDots && event) {
-        for (UITouch *t in event.allTouches) {
-            CGPoint p = t.window ? [t locationInView:t.window] : [t locationInView:t.view];
-            PTDebugUpdate((__bridge void *)t, p, t.phase, NO);
-        }
     }
     // 诊断：非注入触摸会话 Began 打一行 sender
     if (event) {
