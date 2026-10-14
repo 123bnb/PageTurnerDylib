@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.10）
+// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.11）
 //
 // 从 deb 版 PageTurner v1.0.43 移植：
 //   · Tweak.xm 的运行拦截/匹配/执行/可视化（去掉 Preferences 进程分支、总开关、
@@ -822,7 +822,9 @@ static NSMutableDictionary *gDotViews = nil;
 static void PTDebugEnsureWindow(void) {
     if (gDotWindow) return;
     UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    w.windowLevel = UIWindowLevelStatusBar + 1;
+    // v1.0.11：windowLevel 降到 Normal+1（盖住 App 内容但不盖状态栏）——此前 StatusBar+1
+    // 会接管状态栏，导致时间/信号电量颜色被插件窗口控制。现在状态栏彻底归系统/App 管。
+    w.windowLevel = UIWindowLevelNormal + 1;
     w.userInteractionEnabled = NO;
     w.backgroundColor = [UIColor clearColor];
     // v1.0.6：iOS 13+ 多 scene 环境绑定当前 keyWindow 的 scene，否则窗口可能不显示
