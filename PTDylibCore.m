@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.7）
+// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.8）
 //
 // 从 deb 版 PageTurner v1.0.43 移植：
 //   · Tweak.xm 的运行拦截/匹配/执行/可视化（去掉 Preferences 进程分支、总开关、
@@ -317,6 +317,7 @@ NSString *PTActionText(NSDictionary *a) {
     if ([t isEqualToString:@"tap"]) return [NSString stringWithFormat:@"点击(%d, %d)", (int)[a[@"x"] doubleValue], (int)[a[@"y"] doubleValue]];
     if ([t isEqualToString:@"doubleTap"]) return [NSString stringWithFormat:@"双击(%d, %d)", (int)[a[@"x"] doubleValue], (int)[a[@"y"] doubleValue]];
     if ([t isEqualToString:@"swipe"]) return [NSString stringWithFormat:@"滑动 (%d,%d)→(%d,%d)", (int)[a[@"x1"] doubleValue], (int)[a[@"y1"] doubleValue], (int)[a[@"x2"] doubleValue], (int)[a[@"y2"] doubleValue]];
+    if ([t isEqualToString:@"recSwipe"]) return [NSString stringWithFormat:@"滑动(手动) %lu点", (unsigned long)[a[@"pts"] count]];   // v1.0.8
     if ([t isEqualToString:@"delay"]) return [NSString stringWithFormat:@"延迟 %.0fms", [a[@"ms"] doubleValue]];
     if ([t isEqualToString:@"volumeUp"] || [t isEqualToString:@"volumeDown"] || [t isEqualToString:@"muteToggle"])
         return [NSString stringWithFormat:@"%@（已移除）", t];   // v1.0.5：音量动作已删除，旧配置显示提示
@@ -881,6 +882,29 @@ static BOOL gInFakeTouch = NO;
 static int gExecToken = 0;
 static double gLastExec = 0;
 
+// v1.0.8：手动滑动录制（滑动(手动)动作）——录手指真实轨迹，回放按轨迹注入
+static BOOL gRecArmed = NO;                 // 录制页打开
+static double gRecTopY = 0;                 // 录制区上边界（完成按钮行往下，窗口坐标）
+static NSMutableArray *gRecPts = nil;       // 当前轨迹点 @{x,y,t(相对起点毫秒)}
+static double gRecT0 = 0;
+static BOOL gRecActive = NO;                // 正在录一次滑动
+static void (^gRecDone)(NSArray *) = nil;
+
+void PTRecStart(double topY, void (^done)(NSArray *pts)) {
+    gRecTopY = topY;
+    gRecDone = done;
+    gRecPts = nil;
+    gRecActive = NO;
+    gRecArmed = YES;
+}
+
+void PTRecStop(void) {
+    gRecArmed = NO;
+    gRecActive = NO;
+    gRecPts = nil;
+    gRecDone = nil;
+}
+
 // 未命中：暂存轨迹重放给 App
 static void PTReplayTrailAsync(void) {
     if (!gSessTrail || gSessTrail.count < 2) { gSessTrail = nil; return; }
@@ -1014,6 +1038,33 @@ static void PTFakeSwipeAsync(CGPoint from, CGPoint to, double durationMs, int ho
     });
 }
 
+// v1.0.8：手动滑动回放——按录制轨迹逐点注入（保持录制时间间隔，最短 8ms 防风暴）
+static void PTFakeRecSwipeAsync(NSArray *pts, int token, void (^done)(void)) {
+    if (!pts.count) { if (done) done(); return; }
+    __block NSInteger pid = -1;
+    __block int idx = 0;
+    __block void (^step)(void);
+    step = ^(void) {
+        if (token != gExecToken) { if (done) done(); return; }
+        if (idx >= (int)pts.count) { if (done) done(); return; }
+        NSDictionary *pt = pts[idx];
+        CGPoint p = CGPointMake([pt[@"x"] doubleValue], [pt[@"y"] doubleValue]);
+        UITouchPhase ph = (idx == 0) ? UITouchPhaseBegan
+                        : ((idx == (int)pts.count - 1) ? UITouchPhaseEnded : UITouchPhaseMoved);
+        gInFakeTouch = YES;
+        if (idx == 0) pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:p withTouchPhase:ph];
+        else [PTFakeMetaTouch fakeTouchId:pid AtPoint:p withTouchPhase:ph];
+        gInFakeTouch = NO;
+        idx++;
+        if (idx >= (int)pts.count) { if (done) done(); return; }
+        double waitMs = [pts[idx][@"t"] doubleValue] - [pt[@"t"] doubleValue];
+        if (waitMs < 8) waitMs = 8;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(waitMs * NSEC_PER_SEC / 1000)),
+                       dispatch_get_main_queue(), step);
+    };
+    step();
+}
+
 // 执行单条动作 → 完成后 next()
 static void PTRunAction(NSDictionary *a, int token, void (^next)(void)) {
     NSString *type = a[@"type"];
@@ -1042,6 +1093,9 @@ static void PTRunAction(NSDictionary *a, int token, void (^next)(void)) {
         double durMs = (dist / MAX(speed, 1.0)) * 1000.0;
         if (durMs < 50) durMs = 50;
         PTFakeSwipeAsync(from, to, durMs, holdMs, liftMs, noInertia, token, next);
+    } else if ([type isEqualToString:@"recSwipe"]) {
+        // v1.0.8：滑动(手动)——按录制轨迹回放
+        PTFakeRecSwipeAsync(a[@"pts"], token, next);
     } else if ([type isEqualToString:@"delay"]) {
         double ms = [a[@"ms"] doubleValue] ?: 100;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ms / 1000.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
@@ -1112,6 +1166,57 @@ static void PTDylibSendEvent(id self, SEL _cmd, UIEvent *event) {
         for (UITouch *t in event.allTouches) {
             CGPoint p = t.window ? [t locationInView:t.window] : [t locationInView:t.view];
             PTDebugUpdate((__bridge void *)t, p, t.phase, NO);
+        }
+    }
+    // v1.0.8：手动滑动录制——手指在录制区（完成按钮行往下）内的真实轨迹，
+    // Began 在录制区才算开始，抬起/超时 5s 结束回调
+    if (gRecArmed && event && !gInFakeTouch) {
+        NSSet *touches = [event respondsToSelector:@selector(allTouches)] ? event.allTouches : nil;
+        UITouch *t = [touches anyObject];
+        if (t) {
+            CGPoint p = t.window ? [t locationInView:t.window] : [t locationInView:t.view];
+            switch (t.phase) {
+                case UITouchPhaseBegan: {
+                    if (gRecActive) break;   // 已在录（多指）：忽略第二根
+                    if (p.y >= gRecTopY) {
+                        gRecActive = YES;
+                        gRecPts = [NSMutableArray array];
+                        gRecT0 = CACurrentMediaTime();
+                        [gRecPts addObject:@{@"x": @(p.x), @"y": @(p.y), @"t": @(0)}];
+                        NSMutableArray *curPts = gRecPts;
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                                       dispatch_get_main_queue(), ^{
+                            if (gRecActive && gRecPts == curPts) {   // 还是同一次滑动（用户按着不放）
+                                gRecActive = NO;
+                                NSArray *pts = gRecPts;
+                                gRecPts = nil;
+                                if (gRecDone) { gRecDone(pts); gRecDone = nil; }
+                            }
+                        });
+                    } else {
+                        gRecActive = NO;   // 点在按钮行：不录
+                    }
+                    break;
+                }
+                case UITouchPhaseMoved: {
+                    if (gRecActive && gRecPts) {
+                        double tms = (CACurrentMediaTime() - gRecT0) * 1000.0;
+                        [gRecPts addObject:@{@"x": @(p.x), @"y": @(p.y), @"t": @(tms)}];
+                    }
+                    break;
+                }
+                case UITouchPhaseEnded:
+                case UITouchPhaseCancelled: {
+                    if (gRecActive && gRecPts) {
+                        gRecActive = NO;
+                        NSArray *pts = gRecPts;
+                        gRecPts = nil;
+                        if (gRecDone) { gRecDone(pts); gRecDone = nil; }
+                    }
+                    break;
+                }
+                default: break;
+            }
         }
     }
     // 注入触摸/执行中：放行（注入触摸没有 addEvent、sender 残留翻页器，走拦截会把映射触摸 Began 吞掉）

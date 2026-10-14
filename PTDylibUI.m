@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.7）
+// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.8）
 //
 // 从 deb 版 RootListController.m（v1.0.43）移植，改造：
 //   · 基类 PSViewController/PSListController → UIViewController（不依赖 Preferences 框架）
@@ -90,6 +90,13 @@
 @property (nonatomic, strong) NSDictionary *editAction;
 @end
 
+// v1.0.8：滑动(手动)录制页（顶部按钮行往下为录制区）
+@interface PTRecordVC : UIViewController
+@property (nonatomic, copy) NSString *planName;
+@property (nonatomic, strong) UILabel *tip;
+@property (nonatomic, strong) NSArray *lastPts;
+@end
+
 @interface PTActionParamVC : UIViewController
 @property (nonatomic, strong) NSString *planName;
 @property (nonatomic, assign) NSInteger actionIndex;
@@ -173,7 +180,7 @@ static const double kConverge = 60.0;
 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
     if (s == 2) {
-        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.7\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，三指长按弹出本菜单。\n当前配置：%@",
+        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.8\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，三指长按弹出本菜单。\n当前配置：%@",
             PTDylibUsingDebConfig()
                 ? @"复用 deb 版配置（com.yourname.pageturner.plist），与 deb 插件数据互通"
                 : @"独立配置（未检测到 deb 配置，自建 com.yourname.pageturnerdylib.plist）"];
@@ -663,6 +670,7 @@ static const double kConverge = 60.0;
         message:@"选择要添加的动作" preferredStyle:UIAlertControllerStyleActionSheet];
     NSArray *items = @[
         @[@"点击", @"tap"], @[@"双击", @"doubleTap"], @[@"滑动", @"swipe"],
+        @[@"滑动(手动)", @"recSwipe"],   // v1.0.8：录手指真实滑动轨迹回放
         @[@"延迟", @"delay"]];   // v1.0.5：音量+/音量-/静音切换动作类型已删除
     for (NSArray *it in items) {
         [al addAction:[UIAlertAction actionWithTitle:it[0] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
@@ -674,7 +682,12 @@ static const double kConverge = 60.0;
 }
 
 - (void)configAction:(NSString *)type {
-    if ([type isEqualToString:@"delay"]) {
+    if ([type isEqualToString:@"recSwipe"]) {
+        // v1.0.8：滑动(手动)——录制页（顶部按钮行往下是录制区）
+        PTRecordVC *vc = [PTRecordVC new];
+        vc.planName = self.planName;
+        [self.navigationController pushViewController:vc animated:YES];
+    } else if ([type isEqualToString:@"delay"]) {
         UIAlertController *al = [UIAlertController alertControllerWithTitle:@"延迟"
             message:@"输入延迟毫秒数（如 500 = 0.5 秒）" preferredStyle:UIAlertControllerStyleAlert];
         [al addTextFieldWithConfigurationHandler:^(UITextField *tf) { tf.keyboardType = UIKeyboardTypeNumberPad; tf.placeholder = @"500"; }];
@@ -1416,6 +1429,85 @@ static const double kConverge = 60.0;
             } else {
                 [acts addObject:a];
             }
+            np[@"actions"] = acts;
+            [plans addObject:np];
+        } else [plans addObject:p];
+    }
+    cfg[@"plans"] = plans;
+    PTWrite(cfg);
+    [self.navigationController popViewControllerAnimated:YES];
+}
+@end
+
+// ============================================================
+// 滑动(手动)录制页（v1.0.8）
+// 顶部提示条+完成按钮行往下才是录制区；手指在录制区按下开始录，抬起结束；
+// 每次录完显示点数，可重录，点「完成」保存为 recSwipe 动作
+// ============================================================
+@implementation PTRecordVC
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"滑动(手动)";
+    self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"完成"
+        style:UIBarButtonItemStyleDone target:self action:@selector(saveTapped)];
+    // 录制页禁边缘右滑返回（防滑动录制时误触发 pop）
+    if (self.navigationController.interactivePopGestureRecognizer) {
+        self.navigationController.interactivePopGestureRecognizer.enabled = NO;
+    }
+    CGFloat w = self.view.bounds.size.width;
+    self.tip = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, w - 32, 44)];
+    self.tip.text = @"在下方区域用手指滑动录制：按下→滑动→松开。\n松手后点右上角「完成」保存（再滑一次可重录）";
+    self.tip.numberOfLines = 0;
+    self.tip.font = [UIFont systemFontOfSize:14];
+    self.tip.textColor = [UIColor secondaryLabelColor];
+    [self.view addSubview:self.tip];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    // 录制区上边界 = 提示条（按钮行）下缘，转成窗口坐标
+    CGFloat w = self.view.bounds.size.width;
+    CGRect bar = CGRectMake(0, 0, w, 64);
+    CGRect wBar = [self.view convertRect:bar toView:self.view.window];
+    __weak typeof(self) ws = self;
+    PTRecStart(CGRectGetMaxY(wBar), ^(NSArray *pts) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!ws) return;
+            ws.lastPts = pts;
+            ws.tip.text = [NSString stringWithFormat:@"已录 %lu 点 ✓  再滑一次可重录，点右上角「完成」保存",
+                (unsigned long)pts.count];
+        });
+    });
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    PTRecStop();
+    if (self.navigationController.interactivePopGestureRecognizer) {
+        self.navigationController.interactivePopGestureRecognizer.enabled = YES;
+    }
+}
+
+- (void)saveTapped {
+    if (!self.lastPts.count) {
+        UIAlertController *al = [UIAlertController alertControllerWithTitle:@"还没录到滑动"
+            message:@"请在下方区域用手指滑动一次（按下→滑动→松开）" preferredStyle:UIAlertControllerStyleAlert];
+        [al addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:al animated:YES completion:nil];
+        return;
+    }
+    NSMutableDictionary *a = [NSMutableDictionary dictionary];
+    a[@"type"] = @"recSwipe";
+    a[@"pts"] = self.lastPts;
+    NSMutableDictionary *cfg = PTRead();
+    NSMutableArray *plans = [NSMutableArray array];
+    for (NSDictionary *p in cfg[@"plans"] ?: @[]) {
+        if ([p[@"name"] isEqualToString:self.planName]) {
+            NSMutableDictionary *np = [NSMutableDictionary dictionaryWithDictionary:p];
+            NSMutableArray *acts = [NSMutableArray arrayWithArray:np[@"actions"] ?: @[]];
+            [acts addObject:a];
             np[@"actions"] = acts;
             [plans addObject:np];
         } else [plans addObject:p];
