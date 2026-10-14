@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.9）
+// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.10）
 //
 // 从 deb 版 PageTurner v1.0.43 移植：
 //   · Tweak.xm 的运行拦截/匹配/执行/可视化（去掉 Preferences 进程分支、总开关、
@@ -807,19 +807,14 @@ static NSMutableDictionary *gDotViews = nil;
 @end
 @implementation PTDylibOverlayVC
 - (UIStatusBarStyle)preferredStatusBarStyle {
-    UIWindow *kw = [UIApplication sharedApplication].keyWindow;
-    UIViewController *r = kw.rootViewController;
-    if (r && r != self) {
-        @try { return [r preferredStatusBarStyle]; } @catch (NSException *e) {}
-    }
+    // v1.0.10：直接透传系统当前实际状态栏样式（比取 keyWindow rootViewController 更贴合
+    // App 实时显示，避免瞬间变白）
+    @try { return [UIApplication sharedApplication].statusBarStyle; } @catch (NSException *e) {}
     return UIStatusBarStyleDefault;
 }
 - (BOOL)prefersStatusBarHidden {
-    UIWindow *kw = [UIApplication sharedApplication].keyWindow;
-    UIViewController *r = kw.rootViewController;
-    if (r && r != self) {
-        @try { return [r prefersStatusBarHidden]; } @catch (NSException *e) {}
-    }
+    // v1.0.10：透传系统当前状态栏隐藏状态（App 全屏阅读时状态栏正常自动隐藏）
+    @try { return [UIApplication sharedApplication].statusBarHidden; } @catch (NSException *e) {}
     return NO;
 }
 @end
@@ -903,6 +898,12 @@ void PTRecStop(void) {
     gRecActive = NO;
     gRecPts = nil;
     gRecDone = nil;
+}
+
+// v1.0.10：录制页实时画轨迹用（主线程调用，返回当前轨迹副本）
+NSArray *PTRecCurrentPoints(void) {
+    if (!gRecArmed || !gRecPts) return nil;
+    return [NSArray arrayWithArray:gRecPts];
 }
 
 // 未命中：暂存轨迹重放给 App
@@ -1190,7 +1191,7 @@ static void PTDylibSendEvent(id self, SEL _cmd, UIEvent *event) {
                                 gRecActive = NO;
                                 NSArray *pts = gRecPts;
                                 gRecPts = nil;
-                                if (gRecDone) { gRecDone(pts); gRecDone = nil; }
+                                if (gRecDone) { gRecDone(pts); }   // v1.0.10：不置 nil——录制页生命周期内可多次重录，PTRecStop 统一清理
                             }
                         });
                     } else {
@@ -1211,7 +1212,7 @@ static void PTDylibSendEvent(id self, SEL _cmd, UIEvent *event) {
                         gRecActive = NO;
                         NSArray *pts = gRecPts;
                         gRecPts = nil;
-                        if (gRecDone) { gRecDone(pts); gRecDone = nil; }
+                        if (gRecDone) { gRecDone(pts); }   // v1.0.10：不置 nil——录制页生命周期内可多次重录，PTRecStop 统一清理
                     }
                     break;
                 }

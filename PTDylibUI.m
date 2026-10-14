@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.9）
+// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.10）
 //
 // 从 deb 版 RootListController.m（v1.0.43）移植，改造：
 //   · 基类 PSViewController/PSListController → UIViewController（不依赖 Preferences 框架）
@@ -95,6 +95,11 @@
 @property (nonatomic, copy) NSString *planName;
 @property (nonatomic, strong) UILabel *tip;
 @property (nonatomic, strong) NSArray *lastPts;
+@property (nonatomic, assign) NSInteger editIndex;      // v1.0.10：编辑已录动作（>=0 覆盖）
+@property (nonatomic, strong) NSDictionary *editAction;
+@property (nonatomic, strong) CAShapeLayer *trailLayer; // v1.0.10：实时轨迹线
+@property (nonatomic, strong) NSTimer *trailTimer;
+@property (nonatomic, assign) int drawnCount;
 @end
 
 @interface PTActionParamVC : UIViewController
@@ -145,15 +150,15 @@ static const double kConverge = 60.0;
 }
 
 // v1.0.7：状态栏样式透传——菜单窗口 windowLevel 高于状态栏会接管状态栏，导致
-// 时间/信号电池颜色不再跟随 App。透传当前 keyWindow 的样式（UINavigationController
-// 的 topViewController 决定状态栏，即本 VC）。
+// 时间/信号电池颜色不再跟随 App。v1.0.10：直接透传系统当前实际状态栏样式/隐藏状态
+// （比取 keyWindow rootViewController 更贴合 App 实时显示）。
 - (UIStatusBarStyle)preferredStatusBarStyle {
-    UIWindow *kw = [UIApplication sharedApplication].keyWindow;
-    UIViewController *r = kw.rootViewController;
-    if (r && r != self) {
-        @try { return [r preferredStatusBarStyle]; } @catch (NSException *e) {}
-    }
+    @try { return [UIApplication sharedApplication].statusBarStyle; } @catch (NSException *e) {}
     return UIStatusBarStyleDefault;
+}
+- (BOOL)prefersStatusBarHidden {
+    @try { return [UIApplication sharedApplication].statusBarHidden; } @catch (NSException *e) {}
+    return NO;
 }
 
 - (void)viewDidLoad {
@@ -180,7 +185,7 @@ static const double kConverge = 60.0;
 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
     if (s == 2) {
-        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.9\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，三指长按弹出本菜单。\n当前配置：%@",
+        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.10\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，双指长按弹出本菜单。\n当前配置：%@",
             PTDylibUsingDebConfig()
                 ? @"复用 deb 版配置（com.yourname.pageturner.plist），与 deb 插件数据互通"
                 : @"独立配置（未检测到 deb 配置，自建 com.yourname.pageturnerdylib.plist）"];
@@ -590,6 +595,15 @@ static const double kConverge = 60.0;
                 preferredStyle:UIAlertControllerStyleAlert];
             [al addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
             [self presentViewController:al animated:YES completion:nil];
+            return;
+        }
+        // v1.0.10：滑动(手动)已录动作再次点击 → 重新录入（录制页编辑覆盖）
+        if ([type isEqualToString:@"recSwipe"]) {
+            PTRecordVC *vc = [PTRecordVC new];
+            vc.planName = self.planName;
+            vc.editIndex = ip.row;
+            vc.editAction = act;
+            [self.navigationController pushViewController:vc animated:YES];
             return;
         }
         if (![type isEqualToString:@"delay"]) {
@@ -1452,15 +1466,18 @@ static const double kConverge = 60.0;
     self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"完成"
         style:UIBarButtonItemStyleDone target:self action:@selector(saveTapped)];
-    // 录制页禁边缘右滑返回（防滑动录制时误触发 pop）
-    if (self.navigationController.interactivePopGestureRecognizer) {
-        self.navigationController.interactivePopGestureRecognizer.enabled = NO;
-    }
+    // v1.0.10：不再禁边缘返回手势（v1.0.9 禁了导致菜单/App 左滑返回失效）
     // v1.0.9：提示字放录制区中心当背景字（不被灵动岛遮挡），自动换行、不拦截滑动
     CGFloat w = self.view.bounds.size.width, h = self.view.bounds.size.height;
     CGFloat tw = w - 56, th = 180;
     self.tip = [[UILabel alloc] initWithFrame:CGRectMake((w - tw) / 2.0, (h - th) / 2.0, tw, th)];
-    self.tip.text = @"在下方区域用手指滑动录制：按下→滑动→松开。\n松手后点右上角「完成」保存（再滑一次可重录）";
+    if (self.editIndex >= 0 && self.editAction) {
+        self.lastPts = self.editAction[@"pts"];
+        self.tip.text = [NSString stringWithFormat:@"当前已录 %lu 点，再滑一次可重录\n点右上角「完成」保存覆盖",
+            (unsigned long)self.lastPts.count];
+    } else {
+        self.tip.text = @"在下方区域用手指滑动录制：按下→滑动→松开。\n松手后点右上角「完成」保存（再滑一次可重录）";
+    }
     self.tip.numberOfLines = 0;
     self.tip.textAlignment = NSTextAlignmentCenter;
     self.tip.font = [UIFont systemFontOfSize:17];
@@ -1470,6 +1487,13 @@ static const double kConverge = 60.0;
     self.tip.layer.cornerRadius = 12;
     self.tip.layer.masksToBounds = YES;
     [self.view addSubview:self.tip];
+    // v1.0.10：实时轨迹线（录制中手指路径，完成后保留）
+    self.trailLayer = [CAShapeLayer layer];
+    self.trailLayer.strokeColor = [UIColor systemBlueColor].CGColor;
+    self.trailLayer.fillColor = [UIColor clearColor].CGColor;
+    self.trailLayer.lineWidth = 3;
+    self.trailLayer.lineJoin = kCALineJoinRound;
+    [self.view.layer addSublayer:self.trailLayer];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -1487,14 +1511,38 @@ static const double kConverge = 60.0;
                 (unsigned long)pts.count];
         });
     });
+    // v1.0.10：定时器轮询画轨迹（20Hz）
+    self.drawnCount = -1;
+    self.trailTimer = [NSTimer scheduledTimerWithTimeInterval:0.05 target:self
+        selector:@selector(trailTick) userInfo:nil repeats:YES];
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
     [super viewWillDisappear:animated];
     PTRecStop();
-    if (self.navigationController.interactivePopGestureRecognizer) {
-        self.navigationController.interactivePopGestureRecognizer.enabled = YES;
+    [self.trailTimer invalidate];
+    self.trailTimer = nil;
+}
+
+// v1.0.10：实时画轨迹（窗口坐标 → view 坐标）
+- (void)trailTick {
+    NSArray *pts = PTRecCurrentPoints();
+    if (!pts) {
+        if (self.drawnCount != -1) { self.drawnCount = -1; self.trailLayer.path = nil; }
+        return;
     }
+    if ((int)pts.count == self.drawnCount) return;
+    self.drawnCount = (int)pts.count;
+    CGMutablePathRef path = CGPathCreateMutable();
+    for (int i = 0; i < (int)pts.count; i++) {
+        NSDictionary *pt = pts[i];
+        CGPoint p = CGPointMake([pt[@"x"] doubleValue], [pt[@"y"] doubleValue]);
+        CGPoint vp = [self.view convertPoint:p fromView:self.view.window];
+        if (i == 0) CGPathMoveToPoint(path, NULL, vp.x, vp.y);
+        else CGPathAddLineToPoint(path, NULL, vp.x, vp.y);
+    }
+    self.trailLayer.path = path;
+    CGPathRelease(path);
 }
 
 - (void)saveTapped {
@@ -1514,7 +1562,12 @@ static const double kConverge = 60.0;
         if ([p[@"name"] isEqualToString:self.planName]) {
             NSMutableDictionary *np = [NSMutableDictionary dictionaryWithDictionary:p];
             NSMutableArray *acts = [NSMutableArray arrayWithArray:np[@"actions"] ?: @[]];
-            [acts addObject:a];
+            // v1.0.10：编辑已录动作 → 覆盖原位置；新增 → 追加
+            if (self.editIndex >= 0 && self.editAction && self.editIndex < (NSInteger)acts.count) {
+                acts[self.editIndex] = a;
+            } else {
+                [acts addObject:a];
+            }
             np[@"actions"] = acts;
             [plans addObject:np];
         } else [plans addObject:p];

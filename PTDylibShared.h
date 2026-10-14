@@ -44,6 +44,7 @@ extern void PTTestShowDot(CGPoint from, CGPoint to, BOOL animate, double dur);
 // 录制页打开：topY = 录制区上边界（完成按钮行往下），done 每次滑动结束回调（传轨迹点 x/y/t毫秒）
 extern void PTRecStart(double topY, void (^done)(NSArray *pts));
 extern void PTRecStop(void);
+extern NSArray *PTRecCurrentPoints(void);   // v1.0.10：录制页实时画轨迹（主线程）
 
 // ---------- 主菜单窗口（main 实现，UI 关闭按钮调用） ----------
 extern void PTDylibCloseMenu(void);
