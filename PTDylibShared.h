@@ -40,13 +40,19 @@ extern BOOL PTStable(NSArray *mem, NSString *sender);
 extern void PTTestOnEnded(int phase, double dir, double dist, uint64_t sender, int tapDx);
 extern void PTTestShowDot(CGPoint from, CGPoint to, BOOL animate, double dur);
 
-// ---------- 手动滑动录制（v1.0.8，滑动(手动)动作） ----------
-// 录制页打开：topY = 录制区上边界（完成按钮行往下），done 每次滑动结束回调（传轨迹点 x/y/t毫秒）
-extern void PTRecStart(double topY, void (^done)(NSArray *pts));
+// ---------- 手动录制（v1.0.8 滑动(手动)；v1.0.12 点击(手动)/双击(手动)） ----------
+// 录制模式：recSwipe=一次滑动；tapManual=一次点击；doubleTapManual=两次点击
+// topY = 录制区上边界（完成按钮行往下），done 每次录制结束回调（传轨迹点 x/y/t毫秒）
+extern void PTRecStart(NSString *mode, double topY, void (^done)(NSArray *pts));
 extern void PTRecStop(void);
 extern NSArray *PTRecCurrentPoints(void);   // v1.0.10：录制页实时画轨迹（主线程）
+extern void PTRecShowOverlay(NSString *mode, NSString *planName, NSInteger editIndex, NSDictionary *editAction);  // v1.0.12：打开录制覆盖层
+extern void PTDebugMigrateOverlay(void);    // v1.0.12：keyWindow 变化时迁移可视化覆盖层
+extern void PTRecMigrateOverlay(void);      // v1.0.12：keyWindow 变化时迁移录制覆盖层
 
 // ---------- 主菜单窗口（main 实现，UI 关闭按钮调用） ----------
 extern void PTDylibCloseMenu(void);
+extern void PTDylibShowMenu(void);            // v1.0.12：Core 双指检测调用（非 static）
+extern BOOL PTDylibIsMenuWindow(UIWindow *w); // v1.0.12：判断是否菜单窗口（双指检测排除）
 
 #endif

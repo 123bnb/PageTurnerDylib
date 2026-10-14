@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.11）
+// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.12）
 //
 // 从 deb 版 PageTurner v1.0.43 移植：
 //   · Tweak.xm 的运行拦截/匹配/执行/可视化（去掉 Preferences 进程分支、总开关、
@@ -210,7 +210,7 @@ static double gConfigMtime = 0;
 static double gDebounceMs = 300;
 static BOOL gDebugDots = NO;
 static BOOL gDebugLogEnabled = YES;
-static void PTDebugDestroyWindow(void);     // v1.0.7：可视化窗口销毁（前向声明）
+static void PTDebugDestroyOverlay(void);    // v1.0.12：可视化覆盖层销毁（前向声明）
 static NSMutableDictionary *gPlans = nil;      // name -> dict
 static BOOL gLearnActive = NO;
 static uint64_t gLearnedSenders[kMaxLearnedSenders];
@@ -227,9 +227,8 @@ static void PTDylibLoadConfig(BOOL force) {
     double db = [gConfig[@"debounceMs"] doubleValue];
     gDebounceMs = (db > 0) ? db : 300;
     gDebugDots = [gConfig[@"debugDots"] boolValue];
-    // v1.0.7：可视化开关关掉 → 销毁绿点窗口（此前永驻，windowLevel 高于状态栏会接管
-    // 状态栏样式导致时间/信号电池颜色不再跟随 App）
-    if (!gDebugDots) PTDebugDestroyWindow();
+    // v1.0.12：可视化开关关掉 → 销毁绿点覆盖层（覆盖层不碰状态栏，开关只控制显示）
+    if (!gDebugDots) PTDebugDestroyOverlay();
     gDebugLogEnabled = (gConfig[@"debugLogEnabled"] == nil) ? YES : [gConfig[@"debugLogEnabled"] boolValue];
     gPlans = [NSMutableDictionary dictionary];
     gLearnedSenderCount = 0;
@@ -318,6 +317,17 @@ NSString *PTActionText(NSDictionary *a) {
     if ([t isEqualToString:@"doubleTap"]) return [NSString stringWithFormat:@"双击(%d, %d)", (int)[a[@"x"] doubleValue], (int)[a[@"y"] doubleValue]];
     if ([t isEqualToString:@"swipe"]) return [NSString stringWithFormat:@"滑动 (%d,%d)→(%d,%d)", (int)[a[@"x1"] doubleValue], (int)[a[@"y1"] doubleValue], (int)[a[@"x2"] doubleValue], (int)[a[@"y2"] doubleValue]];
     if ([t isEqualToString:@"recSwipe"]) return [NSString stringWithFormat:@"滑动(手动) %lu点", (unsigned long)[a[@"pts"] count]];   // v1.0.8
+    if ([t isEqualToString:@"tapManual"]) {   // v1.0.12
+        NSArray *pts = a[@"pts"];
+        return pts.count ? [NSString stringWithFormat:@"点击(手动)(%d, %d)", (int)[pts[0][@"x"] doubleValue], (int)[pts[0][@"y"] doubleValue]] : @"点击(手动)";
+    }
+    if ([t isEqualToString:@"doubleTapManual"]) {   // v1.0.12
+        NSArray *pts = a[@"pts"];
+        if (pts.count >= 2) return [NSString stringWithFormat:@"双击(手动)(%d, %d)+(%d, %d)",
+            (int)[pts[0][@"x"] doubleValue], (int)[pts[0][@"y"] doubleValue],
+            (int)[pts[1][@"x"] doubleValue], (int)[pts[1][@"y"] doubleValue]];
+        return [NSString stringWithFormat:@"双击(手动) %lu点", (unsigned long)pts.count];
+    }
     if ([t isEqualToString:@"delay"]) return [NSString stringWithFormat:@"延迟 %.0fms", [a[@"ms"] doubleValue]];
     if ([t isEqualToString:@"volumeUp"] || [t isEqualToString:@"volumeDown"] || [t isEqualToString:@"muteToggle"])
         return [NSString stringWithFormat:@"%@（已移除）", t];   // v1.0.5：音量动作已删除，旧配置显示提示
@@ -737,7 +747,7 @@ static BOOL PTHandlePagerEvent(UIEvent *event) {
 @property (nonatomic, strong) NSMutableArray *trail;
 @end
 @implementation PTDebugDot
-- (instancetype)initWithPoint:(CGPoint)p pager:(BOOL)pg window:(UIWindow *)w {
+- (instancetype)initWithPoint:(CGPoint)p pager:(BOOL)pg parentView:(UIView *)pv {
     self = [super init];
     if (self) {
         _pos = p; _pager = pg;
@@ -762,8 +772,8 @@ static BOOL PTHandlePagerEvent(UIEvent *event) {
         _trailLayer.fillColor = [UIColor clearColor].CGColor;
         _trailLayer.lineWidth = 4;
         _trailLayer.lineCap = kCALineCapRound;
-        [w.layer addSublayer:_trailLayer];
-        [w addSubview:_dotView];
+        [pv.layer addSublayer:_trailLayer];
+        [pv addSubview:_dotView];
     }
     return self;
 }
@@ -798,66 +808,51 @@ static BOOL PTHandlePagerEvent(UIEvent *event) {
 }
 @end
 
-static UIWindow *gDotWindow = nil;
+static UIView *gDotOverlay = nil;   // v1.0.12：可视化改为 keyWindow 上的覆盖层 view（不建独立窗口）
 static NSMutableDictionary *gDotViews = nil;
 
-// v1.0.7：插件覆盖窗口的状态栏样式透传——iOS 状态栏样式由最顶层窗口的 rootViewController
-// 决定，空白 VC 会接管状态栏导致颜色不再跟随 App（时间/信号电池变白）。透传当前 keyWindow 样式。
-@interface PTDylibOverlayVC : UIViewController
-@end
-@implementation PTDylibOverlayVC
-- (UIStatusBarStyle)preferredStatusBarStyle {
-    // v1.0.10：直接透传系统当前实际状态栏样式（比取 keyWindow rootViewController 更贴合
-    // App 实时显示，避免瞬间变白）
-    @try { return [UIApplication sharedApplication].statusBarStyle; } @catch (NSException *e) {}
-    return UIStatusBarStyleDefault;
-}
-- (BOOL)prefersStatusBarHidden {
-    // v1.0.10：透传系统当前状态栏隐藏状态（App 全屏阅读时状态栏正常自动隐藏）
-    @try { return [UIApplication sharedApplication].statusBarHidden; } @catch (NSException *e) {}
-    return NO;
-}
-@end
-
-static void PTDebugEnsureWindow(void) {
-    if (gDotWindow) return;
-    UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    // v1.0.11：windowLevel 降到 Normal+1（盖住 App 内容但不盖状态栏）——此前 StatusBar+1
-    // 会接管状态栏，导致时间/信号电量颜色被插件窗口控制。现在状态栏彻底归系统/App 管。
-    w.windowLevel = UIWindowLevelNormal + 1;
-    w.userInteractionEnabled = NO;
-    w.backgroundColor = [UIColor clearColor];
-    // v1.0.6：iOS 13+ 多 scene 环境绑定当前 keyWindow 的 scene，否则窗口可能不显示
+// v1.0.12：可视化不再用独立 UIWindow——独立窗口存在就会参与系统状态栏样式计算
+// （时间/信号电量变白根因）。改为直接叠加在当前 keyWindow 上的透明 view，
+// 零窗口参与状态栏判定，状态栏彻底归系统/App 管。keyWindow 变化时由通知迁移。
+static void PTDebugEnsureOverlay(void) {
+    if (gDotOverlay) return;
     UIWindow *kw = [UIApplication sharedApplication].keyWindow;
-    if (kw && [w respondsToSelector:@selector(setWindowScene:)]) {
-        @try { w.windowScene = kw.windowScene; } @catch (NSException *e) {}
-    }
-    PTDylibOverlayVC *vc = [[PTDylibOverlayVC alloc] init];
-    vc.view.backgroundColor = [UIColor clearColor];
-    w.rootViewController = vc;
-    w.hidden = NO;
-    gDotWindow = w;
+    if (!kw) return;
+    UIView *ov = [[UIView alloc] initWithFrame:kw.bounds];
+    ov.userInteractionEnabled = NO;
+    ov.backgroundColor = [UIColor clearColor];
+    [kw addSubview:ov];
+    gDotOverlay = ov;
     gDotViews = [NSMutableDictionary dictionary];
 }
 
-// v1.0.7：可视化开关关掉时销毁窗口（不再永驻影响状态栏）
-static void PTDebugDestroyWindow(void) {
-    if (!gDotWindow) return;
-    gDotWindow.hidden = YES;
-    [gDotWindow removeFromSuperview];
-    gDotWindow = nil;
+// v1.0.7：可视化开关关掉时销毁（不再永驻影响状态栏）
+static void PTDebugDestroyOverlay(void) {
+    [gDotOverlay removeFromSuperview];
+    gDotOverlay = nil;
     gDotViews = nil;
+}
+
+// v1.0.12：keyWindow 变化时把覆盖层迁到新窗口（旧覆盖层移除重建）
+static void PTDebugMigrateOverlay(void) {
+    if (!gDotOverlay) return;
+    UIWindow *kw = [UIApplication sharedApplication].keyWindow;
+    if (!kw) return;
+    if (gDotOverlay.superview == kw) return;
+    PTDebugDestroyOverlay();
+    PTDebugEnsureOverlay();
 }
 
 static void PTDebugUpdate(void *touchPtr, CGPoint p, UITouchPhase phase, BOOL pager) {
     if (!gDebugDots) return;
     if (![NSThread isMainThread]) return;
-    PTDebugEnsureWindow();
+    PTDebugEnsureOverlay();
+    if (!gDotOverlay) return;
     NSString *key = [NSString stringWithFormat:@"%p", touchPtr];
     PTDebugDot *dot = gDotViews[key];
     if (phase == UITouchPhaseBegan) {
         if (dot) return;
-        dot = [[PTDebugDot alloc] initWithPoint:p pager:pager window:gDotWindow];
+        dot = [[PTDebugDot alloc] initWithPoint:p pager:pager parentView:gDotOverlay];
         gDotViews[key] = dot;
     } else if (phase == UITouchPhaseMoved) {
         if (dot) [dot moveTo:p];
@@ -880,32 +875,51 @@ static int gExecToken = 0;
 static double gLastExec = 0;
 
 // v1.0.8：手动滑动录制（滑动(手动)动作）——录手指真实轨迹，回放按轨迹注入
-static BOOL gRecArmed = NO;                 // 录制页打开
+// v1.0.12：支持 点击(手动)/双击(手动)——录真实点击坐标+时间戳
+static BOOL gRecArmed = NO;                 // 录制覆盖层打开
+static NSString *gRecMode = nil;            // recSwipe / tapManual / doubleTapManual
 static double gRecTopY = 0;                 // 录制区上边界（完成按钮行往下，窗口坐标）
 static NSMutableArray *gRecPts = nil;       // 当前轨迹点 @{x,y,t(相对起点毫秒)}
 static double gRecT0 = 0;
-static BOOL gRecActive = NO;                // 正在录一次滑动
+static BOOL gRecActive = NO;                // 正在录一次触摸序列
+static int gRecTaps = 0;                    // doubleTapManual 已录点击次数
 static void (^gRecDone)(NSArray *) = nil;
 
-void PTRecStart(double topY, void (^done)(NSArray *pts)) {
+void PTRecStart(NSString *mode, double topY, void (^done)(NSArray *pts)) {
+    gRecMode = mode ?: @"recSwipe";
     gRecTopY = topY;
     gRecDone = done;
     gRecPts = nil;
     gRecActive = NO;
+    gRecTaps = 0;
     gRecArmed = YES;
 }
 
 void PTRecStop(void) {
     gRecArmed = NO;
     gRecActive = NO;
+    gRecTaps = 0;
     gRecPts = nil;
     gRecDone = nil;
+    gRecMode = nil;
 }
 
 // v1.0.10：录制页实时画轨迹用（主线程调用，返回当前轨迹副本）
 NSArray *PTRecCurrentPoints(void) {
     if (!gRecArmed || !gRecPts) return nil;
     return [NSArray arrayWithArray:gRecPts];
+}
+
+// v1.0.12：点击/双击录制完成判定（tapManual=1 次点击，doubleTapManual=2 次）
+static void PTRecFinishIfDone(void) {
+    if (!gRecArmed || !gRecActive || !gRecPts) return;
+    int need = [gRecMode isEqualToString:@"doubleTapManual"] ? 2 : 1;
+    if (gRecTaps >= need) {
+        gRecActive = NO;
+        NSArray *pts = gRecPts;
+        gRecPts = nil;
+        if (gRecDone) { gRecDone(pts); }
+    }
 }
 
 // 未命中：暂存轨迹重放给 App
@@ -1099,6 +1113,26 @@ static void PTRunAction(NSDictionary *a, int token, void (^next)(void)) {
     } else if ([type isEqualToString:@"recSwipe"]) {
         // v1.0.8：滑动(手动)——按录制轨迹回放
         PTFakeRecSwipeAsync(a[@"pts"], token, next);
+    } else if ([type isEqualToString:@"tapManual"]) {
+        // v1.0.12：点击(手动)——按录制的真实点击点注入
+        NSArray *pts = a[@"pts"];
+        CGPoint p = pts.count ? CGPointMake([pts[0][@"x"] doubleValue], [pts[0][@"y"] doubleValue])
+                              : CGPointMake(200, 400);
+        PTFakeTap(p, 30);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
+    } else if ([type isEqualToString:@"doubleTapManual"]) {
+        // v1.0.12：双击(手动)——两次点击，间隔按录制时间戳
+        NSArray *pts = a[@"pts"];
+        CGPoint p0 = pts.count >= 1 ? CGPointMake([pts[0][@"x"] doubleValue], [pts[0][@"y"] doubleValue]) : CGPointMake(200, 400);
+        CGPoint p1 = pts.count >= 2 ? CGPointMake([pts[1][@"x"] doubleValue], [pts[1][@"y"] doubleValue]) : p0;
+        double gapMs = (pts.count >= 2) ? ([pts[1][@"t"] doubleValue] - [pts[0][@"t"] doubleValue]) : 120.0;
+        if (gapMs < 40) gapMs = 40;
+        PTFakeTap(p0, 30);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(gapMs / 1000.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (token != gExecToken) { if (next) next(); return; }
+            PTFakeTap(p1, 30);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
+        });
     } else if ([type isEqualToString:@"delay"]) {
         double ms = [a[@"ms"] doubleValue] ?: 100;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ms / 1000.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
@@ -1161,8 +1195,53 @@ static void PTDylibAddEvent(id self, SEL _cmd, void *event) {
     if (gOrigAddEvent) ((void (*)(id, SEL, void *))gOrigAddEvent)(self, _cmd, event);
 }
 
+// v1.0.12：sendEvent 层双指长按检测——两指同时按下 0.5s 不动 → 弹菜单。
+// sendEvent 是 App 所有触摸必经之路，任何页面/角落都能触发，不被 App 手势仲裁抢。
+// 菜单窗口上的触摸不算；手指位移 >25pt 视为移动取消该指。
+static NSMutableDictionary *gFingers = nil;
+static BOOL gGestureFired = NO;
+
+static void PTDylibGestureTick(UIEvent *event) {
+    if (!event) return;
+    if (gRecArmed || gInFakeTouch || gIsInjecting) return;   // v1.0.12：录制/注入中不触发双指
+    if (!gFingers) gFingers = [NSMutableDictionary dictionary];
+    for (UITouch *t in event.allTouches) {
+        if (!t.window) continue;
+        if (PTDylibIsMenuWindow(t.window)) continue;   // 菜单窗口上的触摸不参与
+        NSString *key = [NSString stringWithFormat:@"%p", t];
+        if (t.phase == UITouchPhaseBegan) {
+            CGPoint p = [t locationInView:t.window];
+            gFingers[key] = @{@"t": @(CACurrentMediaTime()), @"x": @(p.x), @"y": @(p.y)};
+        } else if (t.phase == UITouchPhaseMoved) {
+            NSDictionary *f = gFingers[key];
+            if (f) {
+                CGPoint p = [t locationInView:t.window];
+                CGFloat dx = p.x - [f[@"x"] doubleValue], dy = p.y - [f[@"y"] doubleValue];
+                if (dx * dx + dy * dy > 25.0 * 25.0) [gFingers removeObjectForKey:key];
+            }
+        } else if (t.phase == UITouchPhaseEnded || t.phase == UITouchPhaseCancelled) {
+            [gFingers removeObjectForKey:key];
+        }
+    }
+    if (gFingers.count >= 2 && !gGestureFired) {
+        double now = CACurrentMediaTime();
+        BOOL allHold = YES;
+        for (NSDictionary *f in gFingers.allValues) {
+            if (now - [f[@"t"] doubleValue] < 0.5) { allHold = NO; break; }
+        }
+        if (allHold) {
+            gGestureFired = YES;
+            PTDylibShowMenu();
+        }
+    } else if (gFingers.count == 0) {
+        gGestureFired = NO;
+    }
+}
+
 static void PTDylibSendEvent(id self, SEL _cmd, UIEvent *event) {
     PTDylibLoadConfig(NO);
+    // v1.0.12：双指长按检测（最前面，任何触摸都能触发）
+    PTDylibGestureTick(event);
     // v1.0.6：调试可视化先画点（与 deb 对齐——未命中重放/动作执行的注入触摸也画点；
     // 被拦截吞掉的翻页器原始轨迹仍不可见，v1.0.43 语义不变）
     if (gDebugDots && event) {
@@ -1172,37 +1251,60 @@ static void PTDylibSendEvent(id self, SEL _cmd, UIEvent *event) {
         }
     }
     // v1.0.8：手动滑动录制——手指在录制区（完成按钮行往下）内的真实轨迹，
-    // Began 在录制区才算开始，抬起/超时 5s 结束回调
+    // Began 在录制区才算开始，抬起/超时 5s 结束回调（v1.0.12：按模式区分滑动/点击/双击）
     if (gRecArmed && event && !gInFakeTouch) {
         NSSet *touches = [event respondsToSelector:@selector(allTouches)] ? event.allTouches : nil;
         UITouch *t = [touches anyObject];
         if (t) {
             CGPoint p = t.window ? [t locationInView:t.window] : [t locationInView:t.view];
+            BOOL isTapMode = [gRecMode isEqualToString:@"tapManual"] || [gRecMode isEqualToString:@"doubleTapManual"];
             switch (t.phase) {
                 case UITouchPhaseBegan: {
                     if (gRecActive) break;   // 已在录（多指）：忽略第二根
                     if (p.y >= gRecTopY) {
+                        if (!gRecPts) {
+                            gRecPts = [NSMutableArray array];
+                            gRecT0 = CACurrentMediaTime();
+                        }
                         gRecActive = YES;
-                        gRecPts = [NSMutableArray array];
-                        gRecT0 = CACurrentMediaTime();
-                        [gRecPts addObject:@{@"x": @(p.x), @"y": @(p.y), @"t": @(0)}];
-                        NSMutableArray *curPts = gRecPts;
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
-                                       dispatch_get_main_queue(), ^{
-                            if (gRecActive && gRecPts == curPts) {   // 还是同一次滑动（用户按着不放）
-                                gRecActive = NO;
-                                NSArray *pts = gRecPts;
-                                gRecPts = nil;
-                                if (gRecDone) { gRecDone(pts); }   // v1.0.10：不置 nil——录制页生命周期内可多次重录，PTRecStop 统一清理
-                            }
-                        });
+                        if (isTapMode) {
+                            // 点击/双击：记录按下点（一次点击一个点）
+                            double tms = (CACurrentMediaTime() - gRecT0) * 1000.0;
+                            [gRecPts addObject:@{@"x": @(p.x), @"y": @(p.y), @"t": @(tms)}];
+                            gRecTaps++;
+                            // 超时兜底：双指点击第二下一直不来 → 5s 完成
+                            NSMutableArray *curPts = gRecPts;
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                                           dispatch_get_main_queue(), ^{
+                                if (gRecArmed && gRecActive && gRecPts == curPts) {
+                                    gRecActive = NO;
+                                    NSArray *pts = gRecPts;
+                                    gRecPts = nil;
+                                    gRecTaps = 0;
+                                    if (gRecDone) { gRecDone(pts); }
+                                }
+                            });
+                        } else {
+                            // 滑动：记录起点
+                            [gRecPts addObject:@{@"x": @(p.x), @"y": @(p.y), @"t": @(0)}];
+                            NSMutableArray *curPts = gRecPts;
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                                           dispatch_get_main_queue(), ^{
+                                if (gRecActive && gRecPts == curPts) {   // 还是同一次滑动（用户按着不放）
+                                    gRecActive = NO;
+                                    NSArray *pts = gRecPts;
+                                    gRecPts = nil;
+                                    if (gRecDone) { gRecDone(pts); }   // v1.0.10：不置 nil——录制页生命周期内可多次重录，PTRecStop 统一清理
+                                }
+                            });
+                        }
                     } else {
                         gRecActive = NO;   // 点在按钮行：不录
                     }
                     break;
                 }
                 case UITouchPhaseMoved: {
-                    if (gRecActive && gRecPts) {
+                    if (gRecActive && gRecPts && !isTapMode) {
                         double tms = (CACurrentMediaTime() - gRecT0) * 1000.0;
                         [gRecPts addObject:@{@"x": @(p.x), @"y": @(p.y), @"t": @(tms)}];
                     }
@@ -1211,10 +1313,15 @@ static void PTDylibSendEvent(id self, SEL _cmd, UIEvent *event) {
                 case UITouchPhaseEnded:
                 case UITouchPhaseCancelled: {
                     if (gRecActive && gRecPts) {
-                        gRecActive = NO;
-                        NSArray *pts = gRecPts;
-                        gRecPts = nil;
-                        if (gRecDone) { gRecDone(pts); }   // v1.0.10：不置 nil——录制页生命周期内可多次重录，PTRecStop 统一清理
+                        if (isTapMode) {
+                            gRecActive = NO;   // 松开一次点击，等第二次（双击）
+                            PTRecFinishIfDone();   // 点击完成一次，双击需两次
+                        } else {
+                            gRecActive = NO;
+                            NSArray *pts = gRecPts;
+                            gRecPts = nil;
+                            if (gRecDone) { gRecDone(pts); }
+                        }
                     }
                     break;
                 }
