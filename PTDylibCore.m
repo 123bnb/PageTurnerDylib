@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.1）
+// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.2）
 //
 // 从 deb 版 PageTurner v1.0.43 移植：
 //   · Tweak.xm 的运行拦截/匹配/执行/可视化（去掉 Preferences 进程分支、总开关、
@@ -39,7 +39,6 @@
 // ============================================================
 // 常量
 // ============================================================
-static NSString *kDebPrefsName = @"com.yourname.pageturner.plist";
 static NSString *kDylibPrefsName = @"com.yourname.pageturnerdylib.plist";
 static NSString *kDylibLogName = @"PageTurnerDylib.log";
 static const double kPagerWindowSec = 0.4;       // 翻页器活跃窗口（已学 sender 开窗）
@@ -65,31 +64,14 @@ static NSString *sLogFile = nil;
 static double sLogCfgMtime = -1;
 static BOOL sLogEnabled = YES;
 
-static NSString *PTJbrootRoot(void);   // 前向声明
-
-// 日志文件候选：App 容器 Documents / /var/mobile/Documents / jbroot 变体
+// v1.0.2：日志文件固定 App 容器 Documents（TrollStore 注入无沙盒外权限，/var/mobile/Documents
+// 与 jbroot 变体均不可写，不再探测）
 static NSString *PTDylibLogFilePath(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSMutableArray *dirs = [NSMutableArray array];
-    NSArray *base = @[
-        [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject],
-        NSHomeDirectory() ? [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"] : nil,
-        NSTemporaryDirectory(),
-        @"/var/mobile/Documents",
-    ];
-    for (NSString *d in base) {
-        if (!d.length || [dirs containsObject:d]) continue;
-        [dirs addObject:d];
-    }
-    NSString *jb = PTJbrootRoot();
-    if (jb.length) {
-        NSString *jbDoc = [jb stringByAppendingPathComponent:@"var/mobile/Documents"];
-        if (![dirs containsObject:jbDoc]) [dirs addObject:jbDoc];
-    }
-    for (NSString *d in dirs) {
-        if (![fm fileExistsAtPath:d]) [fm createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil];
-        if ([fm isWritableFileAtPath:d]) return [d stringByAppendingPathComponent:kDylibLogName];
-    }
+    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    if (!dir.length) dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    if (![fm fileExistsAtPath:dir]) [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    if ([fm isWritableFileAtPath:dir]) return [dir stringByAppendingPathComponent:kDylibLogName];
     return nil;
 }
 
@@ -168,60 +150,20 @@ double PTNowC(void) {
 
 // ============================================================
 // 配置路径选择
-// 规则（用户定稿）：有 deb 版配置（5 候选路径任一存在）→ 复用 deb 配置；
-//                   没有 → 自建独立配置 com.yourname.pageturnerdylib.plist
+// v1.0.2（用户定稿）：去掉 deb 版 5 候选路径探测 / jbroot 镜像推断 / 双写——
+//   TrollStore 注入的 App 无沙盒外权限，那些路径全部访问不到（读重定向/写失败），
+//   统一固定为 App 容器内自己的配置文件，读写自洽。
 // ============================================================
 static NSString *gCfgPath = nil;
-static BOOL gUsingDebCfg = NO;
 
-static NSString *PTJbrootRoot(void) {
-    static NSString *root = nil;
-    static dispatch_once_t on;
-    dispatch_once(&on, ^{
-        uint32_t n = _dyld_image_count();
-        for (uint32_t i = 0; i < n; i++) {
-            const char *img = _dyld_get_image_name(i);
-            if (!img) continue;
-            NSString *p = [NSString stringWithUTF8String:img];
-            NSRange r = [p rangeOfString:@"/.jbroot-"];
-            if (r.location == NSNotFound) continue;
-            NSRange after = NSMakeRange(NSMaxRange(r), p.length - NSMaxRange(r));
-            NSRange slash = [p rangeOfString:@"/" options:0 range:after];
-            NSUInteger end = (slash.location != NSNotFound) ? slash.location : p.length;
-            root = [p substringToIndex:end];
-            break;
-        }
-    });
-    return root;
-}
-
-// 生成 5 候选路径（与 deb PTGlobalPlistPath 同模式）
-static NSArray *PTDylibCandidatePaths(NSString *name) {
-    NSMutableArray *cands = [NSMutableArray array];
-    [cands addObject:[@"/var/mobile/Library/Preferences" stringByAppendingPathComponent:name]];
-    NSString *jb = PTJbrootRoot();
-    if (jb.length) {
-        [cands addObject:[jb stringByAppendingPathComponent:[@"var/mobile/Library/Preferences" stringByAppendingPathComponent:name]]];
-        [cands addObject:[jb stringByAppendingPathComponent:[@"Library/Preferences" stringByAppendingPathComponent:name]]];
-    }
-    [cands addObject:[@"/var/jb/var/mobile/Library/Preferences" stringByAppendingPathComponent:name]];
-    [cands addObject:[@"/var/jb/Library/Preferences" stringByAppendingPathComponent:name]];
-    return cands;
-}
-
-// 启动时决定一次：deb 配置存在 → 复用；否则 dylib 独立（首选路径）
 static void PTDylibInitConfigPath(void) {
     if (gCfgPath) return;
-    NSFileManager *fm = NSFileManager.defaultManager;
-    for (NSString *p in PTDylibCandidatePaths(kDebPrefsName)) {
-        if ([fm fileExistsAtPath:p]) { gCfgPath = p; gUsingDebCfg = YES; return; }
-    }
-    for (NSString *p in PTDylibCandidatePaths(kDylibPrefsName)) {
-        if ([fm fileExistsAtPath:p]) { gCfgPath = p; gUsingDebCfg = NO; return; }
-    }
-    // 都没有 → 独立配置主路径（首次写入时创建）
-    gCfgPath = [@"/var/mobile/Library/Preferences" stringByAppendingPathComponent:kDylibPrefsName];
-    gUsingDebCfg = NO;
+    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) firstObject];
+    if (!dir.length) dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library"];
+    gCfgPath = [dir stringByAppendingPathComponent:[@"Preferences" stringByAppendingPathComponent:kDylibPrefsName]];
+    // 容器 Library/Preferences 目录可能不存在，确保可写
+    [[NSFileManager defaultManager] createDirectoryAtPath:[gCfgPath stringByDeletingLastPathComponent]
+                             withIntermediateDirectories:YES attributes:nil error:nil];
 }
 
 NSString *PTDylibCfgPath(void) {
@@ -230,12 +172,11 @@ NSString *PTDylibCfgPath(void) {
 }
 
 BOOL PTDylibUsingDebConfig(void) {
-    PTDylibInitConfigPath();
-    return gUsingDebCfg;
+    return NO;   // v1.0.2：不再复用 deb 配置（沙盒读不到），恒为独立容器配置
 }
 
 // ============================================================
-// 配置读写（原子写；当前路径 + jbroot 镜像路径双写）
+// 配置读写（v1.0.2：只写容器内单一路径，原子写）
 // ============================================================
 NSMutableDictionary *PTDylibReadCfg(void) {
     NSString *p = PTDylibCfgPath();
@@ -248,23 +189,10 @@ void PTDylibWriteCfg(NSDictionary *cfg) {
         format:NSPropertyListXMLFormat_v1_0 options:0 error:NULL];
     if (!data) return;
     NSString *p = PTDylibCfgPath();
-    NSMutableArray *targets = [NSMutableArray array];
-    // jbroot 镜像路径（App 沙盒重定向下仍可读）+ 当前路径
-    NSString *fileName = [p lastPathComponent];
-    NSString *jb = PTJbrootRoot();
-    if (jb.length) {
-        [targets addObject:[jb stringByAppendingPathComponent:
-            [@"var/mobile/Library/Preferences" stringByAppendingPathComponent:fileName]]];
-        [targets addObject:[jb stringByAppendingPathComponent:
-            [@"Library/Preferences" stringByAppendingPathComponent:fileName]]];
-    }
-    if (![targets containsObject:p]) [targets addObject:p];
-    for (NSString *t in targets) {
-        NSString *tmp = [t stringByAppendingString:@".tmp"];
-        [data writeToFile:tmp atomically:YES];
-        [[NSFileManager defaultManager] removeItemAtPath:t error:nil];
-        [[NSFileManager defaultManager] moveItemAtPath:tmp toPath:t error:nil];
-    }
+    NSString *tmp = [p stringByAppendingString:@".tmp"];
+    [data writeToFile:tmp atomically:YES];
+    [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
+    [[NSFileManager defaultManager] moveItemAtPath:tmp toPath:p error:nil];
 }
 
 void PTDylibSetLearningLocal(BOOL on) {
@@ -540,6 +468,29 @@ static float PTReadVolumeViaCategory(void) {
     } @catch (NSException *e) { return 0.5f; }
 }
 
+// v1.0.2（与 deb v1.0.45 同步）：音量±目标值状态——不依赖 get 回读（第三方 App 里
+// getVolumeForCategory 不可靠，恒 0.5 兜底 → 旧写法目标值每次相同 → 二次按键音量不变）
+static float gVolumeTarget = -1;   // -1=未初始化
+
+// 真实音量回读（失败返回 -1，区别于 0.5 兜底）——用于初始化音量±目标状态
+static float PTGetVolumeRealEx(void) {
+    @try {
+        id c = [NSClassFromString(@"AVSystemController") performSelector:NSSelectorFromString(@"sharedAVSystemController")];
+        for (NSString *cat in PTVolumeCategories()) {
+            id v = [c performSelector:NSSelectorFromString(@"getVolumeForCategory:") withObject:cat];
+            if (v) return [v floatValue];
+        }
+        return -1;
+    } @catch (NSException *e) { return -1; }
+}
+
+// 音量± 步进（测试区与运行端共用）：返回本次目标值
+static float PTVolumeStep(BOOL up) {
+    if (gVolumeTarget < 0) { float real = PTGetVolumeRealEx(); gVolumeTarget = (real >= 0) ? real : 0.5f; }
+    gVolumeTarget = up ? MIN(1.0f, gVolumeTarget + 0.0625f) : MAX(0.0f, gVolumeTarget - 0.0625f);
+    return gVolumeTarget;
+}
+
 // MPVolumeView 兜底：主队列异步建视图（加入 keyWindow 隐藏位），下一 runloop 遍历找 UISlider
 static void PTVolumeViaSlider(float v) {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -577,6 +528,7 @@ static void PTSetVolumeEx(float v) {
             if ([r boolValue]) {
                 id nv = [c performSelector:NSSelectorFromString(@"getVolumeForCategory:") withObject:cat];
                 if (nv && fabs([nv floatValue] - v) < 0.01f) {
+                    gVolumeTarget = [nv floatValue];   // 回读确认成功 → 同步目标状态（防漂移）
                     PTDylibLog(@"[音量] %.2f ✓ AVSystemController(%@)", v, cat);
                     return;
                 }
@@ -588,10 +540,6 @@ static void PTSetVolumeEx(float v) {
         PTDylibLog(@"[音量] %.2f ✗ 异常，尝试 MPVolumeView 兜底", v);
         PTVolumeViaSlider(v);
     }
-}
-
-static float PTTestGetVolume(void) {
-    return PTReadVolumeViaCategory();
 }
 
 static void PTTestSetVolume(float v) {
@@ -673,14 +621,14 @@ static void PTTestRunAction(NSDictionary *a, void (^next)(void)) {
         double ms = [a[@"ms"] doubleValue] ?: 100;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ms / 1000.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
     } else if ([type isEqualToString:@"volumeUp"]) {
-        PTTestSetVolume(MIN(1.0, PTTestGetVolume() + 0.0625));
+        PTTestSetVolume(PTVolumeStep(YES));
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
     } else if ([type isEqualToString:@"volumeDown"]) {
-        PTTestSetVolume(MAX(0.0, PTTestGetVolume() - 0.0625));
+        PTTestSetVolume(PTVolumeStep(NO));
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
     } else if ([type isEqualToString:@"muteToggle"]) {
         static float sTestMuted = -1;
-        if (sTestMuted < 0) { sTestMuted = PTTestGetVolume(); PTTestSetVolume(0); }
+        if (sTestMuted < 0) { sTestMuted = (gVolumeTarget >= 0) ? gVolumeTarget : ((PTGetVolumeRealEx() >= 0) ? PTGetVolumeRealEx() : 0.5f); PTTestSetVolume(0); }
         else { PTTestSetVolume(sTestMuted); sTestMuted = -1; }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
     } else {
@@ -1170,13 +1118,13 @@ static void PTRunAction(NSDictionary *a, int token, void (^next)(void)) {
         double ms = [a[@"ms"] doubleValue] ?: 100;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ms / 1000.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
     } else if ([type isEqualToString:@"volumeUp"]) {
-        PTSetVolume(MIN(1.0, PTGetVolume() + 0.0625));
+        PTSetVolume(PTVolumeStep(YES));
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
     } else if ([type isEqualToString:@"volumeDown"]) {
-        PTSetVolume(MAX(0.0, PTGetVolume() - 0.0625));
+        PTSetVolume(PTVolumeStep(NO));
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
     } else if ([type isEqualToString:@"muteToggle"]) {
-        if (gMutedVolume < 0) { gMutedVolume = PTGetVolume(); PTSetVolume(0); }
+        if (gMutedVolume < 0) { gMutedVolume = (gVolumeTarget >= 0) ? gVolumeTarget : ((PTGetVolumeRealEx() >= 0) ? PTGetVolumeRealEx() : 0.5f); PTSetVolume(0); }
         else { PTSetVolume(gMutedVolume); gMutedVolume = -1; }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
     } else {
