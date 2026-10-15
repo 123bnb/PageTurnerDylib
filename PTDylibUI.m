@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.13）
+// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.14）
 //
 // 从 deb 版 RootListController.m（v1.0.43）移植，改造：
 //   · 基类 PSViewController/PSListController → UIViewController（不依赖 Preferences 框架）
@@ -177,7 +177,7 @@ static const double kConverge = 60.0;
 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
     if (s == 2) {
-        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.13\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，双指长按弹出本菜单。\n当前配置：%@",
+        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.14\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，双指长按弹出本菜单。\n当前配置：%@",
             PTDylibUsingDebConfig()
                 ? @"复用 deb 版配置（com.yourname.pageturner.plist），与 deb 插件数据互通"
                 : @"独立配置（未检测到 deb 配置，自建 com.yourname.pageturnerdylib.plist）"];
@@ -589,11 +589,14 @@ static const double kConverge = 60.0;
             [self presentViewController:al animated:YES completion:nil];
             return;
         }
-        // v1.0.12：手动动作（滑动(手动)/点击(手动)/双击(手动)）已录动作再次点击 → 覆盖层重新录入
-        if ([type isEqualToString:@"recSwipe"] || [type isEqualToString:@"tapManual"] || [type isEqualToString:@"doubleTapManual"]) {
+        // v1.0.14：滑动(手动)已录动作再次点击 → 覆盖层重新录入；旧配置残留的点击(手动)/双击(手动)
+        // 转对应普通动作编辑（保存后即转普通动作，手动点击录制已删）
+        if ([type isEqualToString:@"recSwipe"]) {
             PTRecShowOverlay(type, self.planName, ip.row, act);
             return;
         }
+        if ([type isEqualToString:@"tapManual"]) type = @"tap";
+        else if ([type isEqualToString:@"doubleTapManual"]) type = @"doubleTap";
         if (![type isEqualToString:@"delay"]) {
             PTActionVC *vc = [PTActionVC new];
             vc.planName = self.planName;
@@ -672,9 +675,7 @@ static const double kConverge = 60.0;
         message:@"选择要添加的动作" preferredStyle:UIAlertControllerStyleActionSheet];
     NSArray *items = @[
         @[@"点击", @"tap"], @[@"双击", @"doubleTap"], @[@"滑动", @"swipe"],
-        @[@"滑动(手动)", @"recSwipe"],   // v1.0.8：录手指真实滑动轨迹回放
-        @[@"点击(手动)", @"tapManual"],  // v1.0.12：实地点击录制
-        @[@"双击(手动)", @"doubleTapManual"],  // v1.0.12：实地双击录制
+        @[@"滑动(手动)", @"recSwipe"],   // v1.0.14：点击(手动)/双击(手动)已删，仅保留滑动(手动)
         @[@"延迟", @"delay"]];   // v1.0.5：音量+/音量-/静音切换动作类型已删除
     for (NSArray *it in items) {
         [al addAction:[UIAlertAction actionWithTitle:it[0] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
@@ -686,8 +687,8 @@ static const double kConverge = 60.0;
 }
 
 - (void)configAction:(NSString *)type {
-    if ([type isEqualToString:@"recSwipe"] || [type isEqualToString:@"tapManual"] || [type isEqualToString:@"doubleTapManual"]) {
-        // v1.0.12：手动录制——覆盖层（关菜单 → 覆盖到 App 上实地操作）
+    if ([type isEqualToString:@"recSwipe"]) {
+        // v1.0.14：滑动(手动)——覆盖层（关菜单 → 覆盖到 App 上实地操作，仅此一种手动动作）
         PTRecShowOverlay(type, self.planName, -1, nil);
     } else if ([type isEqualToString:@"delay"]) {
         UIAlertController *al = [UIAlertController alertControllerWithTitle:@"延迟"
@@ -1580,15 +1581,17 @@ void PTRecShowOverlay(NSString *mode, NSString *planName, NSInteger editIndex, N
     gRecOverlay = ov;
 
     // 顶部按钮行（56pt）：可交互（完成/取消），以下为录制区
+    // v1.0.14：按钮行下移到顶部安全区以下——此前从 y=0 开始，灵动岛机型按钮被灵动岛挡住按不到
     CGFloat w = kw.bounds.size.width;
     CGFloat h = kw.bounds.size.height;
-    UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 56)];
+    CGFloat topInset = MAX(kw.safeAreaInsets.top, 20.0);   // 灵动岛≈54-59pt，刘海≈44pt，无刘海≈20pt
+    UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, topInset, w, 56)];
     bar.userInteractionEnabled = YES;
     bar.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.78];
     [ov addSubview:bar];
 
     gRecCancelBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    gRecCancelBtn.frame = CGRectMake(8, 10, 60, 36);
+    gRecCancelBtn.frame = CGRectMake(8, topInset + 10, 60, 36);
     [gRecCancelBtn setTitle:@"取消" forState:UIControlStateNormal];
     gRecCancelBtn.titleLabel.font = [UIFont systemFontOfSize:16];
     [gRecCancelBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
@@ -1596,14 +1599,14 @@ void PTRecShowOverlay(NSString *mode, NSString *planName, NSInteger editIndex, N
     [bar addSubview:gRecCancelBtn];
 
     gRecDoneBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    gRecDoneBtn.frame = CGRectMake(w - 68, 10, 60, 36);
+    gRecDoneBtn.frame = CGRectMake(w - 68, topInset + 10, 60, 36);
     [gRecDoneBtn setTitle:@"完成" forState:UIControlStateNormal];
     gRecDoneBtn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
     [gRecDoneBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     [gRecDoneBtn addTarget:gRecBtnTarget action:@selector(doneTapped) forControlEvents:UIControlEventTouchUpInside];
     [bar addSubview:gRecDoneBtn];
 
-    UILabel *barTip = [[UILabel alloc] initWithFrame:CGRectMake(76, 12, w - 152, 32)];
+    UILabel *barTip = [[UILabel alloc] initWithFrame:CGRectMake(76, topInset + 12, w - 152, 32)];
     barTip.text = @"按钮行以下为录制区，实地滑动/点击即录制";
     barTip.font = [UIFont systemFontOfSize:12];
     barTip.textColor = [UIColor whiteColor];
@@ -1639,10 +1642,10 @@ void PTRecShowOverlay(NSString *mode, NSString *planName, NSInteger editIndex, N
     gRecTrailLayer.lineJoin = kCALineJoinRound;
     [ov.layer addSublayer:gRecTrailLayer];
 
-    // 开始录制：topY=56（按钮行下缘，窗口坐标），录制区=按钮行往下
+    // 开始录制：topY=按钮行下缘（安全区顶+56，窗口坐标），录制区=按钮行往下
     gRecDrawnCount = -1;
     __weak __block UIView *wov = ov;
-    PTRecStart(mode, 56.0, ^(NSArray *pts) {
+    PTRecStart(mode, topInset + 56.0, ^(NSArray *pts) {
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!wov || !gRecOverlay) return;
             gRecLastPts = pts;
