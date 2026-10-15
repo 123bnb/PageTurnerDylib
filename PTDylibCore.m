@@ -948,20 +948,22 @@ static void PTReplayTrailAsync(void) {
     if (!gSessTrail || gSessTrail.count < 2) { gSessTrail = nil; return; }
     NSArray *pts = [gSessTrail copy];
     gSessTrail = nil;
+    NSUInteger n = pts.count;
+    // v1.0.18：回放「未命中」的原始轨迹时必须保持足够点密度，否则 UIScrollView 在
+    // 两点之间收不到 Moved 事件而阶梯跳变（卡顿）。原先 k = MIN(n - 2, 10) 把轨迹
+    // 砍到最多 10 个中间点 —— 这里改为全量回放原始采样点，密度跟随录制轨迹。
     CGPoint from = [pts.firstObject CGPointValue];
     CGPoint to = [pts.lastObject CGPointValue];
-    NSMutableArray *mids = [NSMutableArray array];
-    NSUInteger n = pts.count;
-    NSUInteger k = MIN(n - 2, 10u);
-    for (NSUInteger i = 0; i < k; i++) {
-        NSUInteger idx = 1 + (i * (n - 2)) / k;
-        if (idx >= n - 1) idx = n - 2;
-        [mids addObject:pts[idx]];
-    }
+    NSMutableArray *mids = [NSMutableArray arrayWithCapacity:n];
+    for (NSUInteger i = 1; i < n - 1; i++) [mids addObject:pts[i]];
+
     gIsInjecting = YES;
     gInFakeTouch = YES;
     NSInteger pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:from withTouchPhase:UITouchPhaseBegan];
     gInFakeTouch = NO;
+    // v1.0.18：按屏幕刷新节奏（~60Hz，16.6ms/点）逐点推进，密度接近真实手指，
+    // 不再把整段滑动压缩进 ~120ms。宗旨不变：未命中时仍把原始轨迹还原给 App。
+    static const double kReplayStepSec = 1.0 / 60.0;
     __block NSUInteger i = 0;
     __block void (^step)(void);
     step = ^(void) {
@@ -970,16 +972,16 @@ static void PTReplayTrailAsync(void) {
             [PTFakeMetaTouch fakeTouchId:pid AtPoint:to withTouchPhase:UITouchPhaseEnded];
             gInFakeTouch = NO;
             gIsInjecting = NO;
-            PTDylibLog(@"[重放] 未命中：原始轨迹已重放给 App（%lu 中间点）", (unsigned long)mids.count);
+            PTDylibLog(@"[重放] 未命中：原始轨迹已重放给 App（%lu 点）", (unsigned long)mids.count);
             return;
         }
         gInFakeTouch = YES;
         [PTFakeMetaTouch fakeTouchId:pid AtPoint:[mids[i] CGPointValue] withTouchPhase:UITouchPhaseMoved];
         gInFakeTouch = NO;
         i++;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.012 * NSEC_PER_SEC)), dispatch_get_main_queue(), step);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kReplayStepSec * NSEC_PER_SEC)), dispatch_get_main_queue(), step);
     };
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.016 * NSEC_PER_SEC)), dispatch_get_main_queue(), step);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kReplayStepSec * NSEC_PER_SEC)), dispatch_get_main_queue(), step);
 }
 
 // 点击（同步短阻塞）
