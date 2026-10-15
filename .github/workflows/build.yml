@@ -30,6 +30,12 @@ jobs:
           SDK="$GITHUB_WORKSPACE/sdks/iPhoneOS16.5.sdk"
           mkdir -p out
           SRCS="PTDylibMain.m PTDylibCore.m PTDylibUI.m ptftouch/PTFakeMetaTouch.m ptftouch/UITouch-KIFAdditions.m ptftouch/UIEvent+KIFAdditions.m ptftouch/IOHIDEvent+KIF.m"
+          # v1.0.20：产物文件名带版本号——打 tag(v*) 用 tag 名，普通 push 用 dev-<短sha>
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then VER="${GITHUB_REF_NAME}"; else VER="dev-${GITHUB_SHA:0:7}"; fi
+          OUT="out/PageTurnerDylib_${VER}.dylib"
+          echo "VER=${VER}" >> "$GITHUB_ENV"
+          echo "OUT_NAME=PageTurnerDylib_${VER}.dylib" >> "$GITHUB_ENV"
+          echo "输出产物: ${OUT}"
           # 先试 arm64+arm64e；arm64e 若失败则只 arm64
           clang -arch arm64 -arch arm64e -isysroot "$SDK" -miphoneos-version-min=15.0 \
             -fobjc-arc -fobjc-abi-version=2 \
@@ -37,7 +43,7 @@ jobs:
             -Wno-unused-variable -Wno-deprecated-declarations -Wno-arc-performSelector-leaks \
             -Iptftouch -include ptftouch/Compat.h \
             -framework Foundation -framework UIKit \
-            -dynamiclib $SRCS -o out/PageTurnerDylib.dylib \
+            -dynamiclib $SRCS -o "$OUT" \
             && echo "编译 OK (arm64+arm64e)" \
             || { echo "arm64+arm64e 失败, 尝试只 arm64"; \
                  clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 \
@@ -46,24 +52,24 @@ jobs:
                    -Wno-unused-variable -Wno-deprecated-declarations -Wno-arc-performSelector-leaks \
                    -Iptftouch -include ptftouch/Compat.h \
                    -framework Foundation -framework UIKit \
-                   -dynamiclib $SRCS -o out/PageTurnerDylib.dylib \
+                   -dynamiclib $SRCS -o "$OUT" \
                    && echo "编译 OK (仅arm64)"; }
-          file out/PageTurnerDylib.dylib
-          ldid -S out/PageTurnerDylib.dylib && echo "ldid 签名 OK"
+          file "$OUT"
+          ldid -S "$OUT" && echo "ldid 签名 OK"
 
       - name: Upload artifact (dylib)
         uses: actions/upload-artifact@v4
         with:
-          name: PageTurnerDylib-dylib
-          path: out/PageTurnerDylib.dylib
+          name: PageTurnerDylib-${{ env.VER }}
+          path: out/${{ env.OUT_NAME }}
 
       - name: Publish Release (on tag)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: out/PageTurnerDylib.dylib
+          files: out/${{ env.OUT_NAME }}
           name: PageTurnerDylib ${{ github.ref_name }}
           body: |
-            PageTurnerDylib v${{ github.ref_name }} — 独立 dylib 版（巨魔注入器 TrollFools 注入任意 App，三指长按弹出设置菜单）
+            PageTurnerDylib ${{ github.ref_name }} — 独立 dylib 版（巨魔注入器 TrollFools 注入任意 App，三指长按弹出设置菜单）
           draft: false
           prerelease: false

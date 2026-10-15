@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibMain.m —— PageTurnerDylib 入口（v1.0.19）
+// PTDylibMain.m —— PageTurnerDylib 入口（v1.0.20）
 //
 // 注入即生效：constructor → 主队列安装 hook。
 // v1.0.12：不再用手势识别器（会被 App 手势仲裁抢）——双指长按改由
@@ -82,7 +82,7 @@ static void PTDylibInit(void) {
                 NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"?";
                 PTDylibInstallHooks();
                 PTDylibLog(@"==================================================");
-                PTDylibLog(@"PageTurnerDylib v1.0.19 已注入 %@ (pid=%d) 配置来源=%@",
+                PTDylibLog(@"PageTurnerDylib v1.0.20 已注入 %@ (pid=%d) 配置来源=%@",
                     bid, getpid(), PTDylibUsingDebConfig() ? @"复用deb配置" : @"独立配置");
                 PTDylibLog(@"配置路径=%@ 防抖=%.0fms 方案数=%lu",
                     PTDylibCfgPath(),

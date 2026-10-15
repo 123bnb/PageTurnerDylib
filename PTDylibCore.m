@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.19）
+// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.20）
 //
 // 从 deb 版 PageTurner v1.0.43 移植：
 //   · Tweak.xm 的运行拦截/匹配/执行/可视化（去掉 Preferences 进程分支、总开关、
@@ -551,7 +551,17 @@ static void PTTestRunAction(NSDictionary *a, void (^next)(void)) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ms / 1000.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), next);
     } else if ([type isEqualToString:@"recSwipe"]) {
         // v1.0.13：测试区支持滑动(手动)回放——此前缺分支被 else 跳过，注入轨迹看不到
-        PTFakeRecSwipeAsync(a[@"pts"], gExecToken, next);
+        // v1.0.20：补上测试页轨迹可视化——绿点沿录制起点→终点移动，时长对齐录制耗时，
+        // 否则测试本方案里滑动(手动)虽正常注入、却看不到轨迹（与「滑动」类型表现一致）。
+        NSArray *pts = a[@"pts"];
+        if (pts.count) {
+            CGPoint from = CGPointMake([pts[0][@"x"] doubleValue], [pts[0][@"y"] doubleValue]);
+            CGPoint to = CGPointMake([pts[pts.count - 1][@"x"] doubleValue], [pts[pts.count - 1][@"y"] doubleValue]);
+            double t0 = [pts[0][@"t"] doubleValue];
+            double t1 = [pts[pts.count - 1][@"t"] doubleValue];
+            PTTestShowDot(from, to, YES, MAX(t1 - t0, 50) / 1000.0);
+        }
+        PTFakeRecSwipeAsync(pts, gExecToken, next);
     } else if ([type isEqualToString:@"tapManual"]) {
         NSArray *pts = a[@"pts"];
         CGPoint p = pts.count ? CGPointMake([pts[0][@"x"] doubleValue], [pts[0][@"y"] doubleValue]) : CGPointMake(200, 400);
