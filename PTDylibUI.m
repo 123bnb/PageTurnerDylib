@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.16）
+// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.17）
 //
 // 从 deb 版 RootListController.m（v1.0.43）移植，改造：
 //   · 基类 PSViewController/PSListController → UIViewController（不依赖 Preferences 框架）
@@ -177,7 +177,7 @@ static const double kConverge = 60.0;
 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
     if (s == 2) {
-        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.16\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，双指长按弹出本菜单。\n当前配置：%@",
+        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.17\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，双指长按弹出本菜单。\n当前配置：%@",
             PTDylibUsingDebConfig()
                 ? @"复用 deb 版配置（com.yourname.pageturner.plist），与 deb 插件数据互通"
                 : @"独立配置（未检测到 deb 配置，自建 com.yourname.pageturnerdylib.plist）"];
@@ -1616,7 +1616,7 @@ void PTRecShowOverlay(NSString *mode, NSString *planName, NSInteger editIndex, N
     ov.interactiveBar = bar;   // v1.0.15：hitTest 局部命中范围（按钮行）
 
     gRecCancelBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    gRecCancelBtn.frame = CGRectMake(8, topInset + 10, 60, 36);
+    gRecCancelBtn.frame = CGRectMake(8, 10, 60, 36);   // v1.0.17：bar 内相对坐标（此前误用 topInset+10 导致按钮溢出 bar 底部渲染在横幅下方）
     [gRecCancelBtn setTitle:@"取消" forState:UIControlStateNormal];
     gRecCancelBtn.titleLabel.font = [UIFont systemFontOfSize:16];
     [gRecCancelBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
@@ -1624,15 +1624,15 @@ void PTRecShowOverlay(NSString *mode, NSString *planName, NSInteger editIndex, N
     [bar addSubview:gRecCancelBtn];
 
     gRecDoneBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    gRecDoneBtn.frame = CGRectMake(w - 68, topInset + 10, 60, 36);
+    gRecDoneBtn.frame = CGRectMake(w - 68, 10, 60, 36);   // v1.0.17：bar 内相对坐标
     [gRecDoneBtn setTitle:@"完成" forState:UIControlStateNormal];
     gRecDoneBtn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
     [gRecDoneBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     [gRecDoneBtn addTarget:gRecBtnTarget action:@selector(doneTapped) forControlEvents:UIControlEventTouchUpInside];
     [bar addSubview:gRecDoneBtn];
 
-    UILabel *barTip = [[UILabel alloc] initWithFrame:CGRectMake(76, topInset + 12, w - 152, 32)];
-    barTip.text = @"v1.0.16｜按钮行以下为录制区";   // v1.0.16：带版本号，便于确认加载的是新版
+    UILabel *barTip = [[UILabel alloc] initWithFrame:CGRectMake(76, 12, w - 152, 32)];   // v1.0.17：bar 内相对坐标
+    barTip.text = @"v1.0.17｜按钮行以下为录制区";   // v1.0.16：带版本号，便于确认加载的是新版
     barTip.font = [UIFont systemFontOfSize:12];
     barTip.textColor = [UIColor whiteColor];
     barTip.textAlignment = NSTextAlignmentCenter;
