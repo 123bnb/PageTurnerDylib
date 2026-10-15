@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.14）
+// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.15）
 //
 // 从 deb 版 RootListController.m（v1.0.43）移植，改造：
 //   · 基类 PSViewController/PSListController → UIViewController（不依赖 Preferences 框架）
@@ -177,7 +177,7 @@ static const double kConverge = 60.0;
 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
     if (s == 2) {
-        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.14\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，双指长按弹出本菜单。\n当前配置：%@",
+        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.15\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，双指长按弹出本菜单。\n当前配置：%@",
             PTDylibUsingDebConfig()
                 ? @"复用 deb 版配置（com.yourname.pageturner.plist），与 deb 插件数据互通"
                 : @"独立配置（未检测到 deb 配置，自建 com.yourname.pageturnerdylib.plist）"];
@@ -1481,6 +1481,22 @@ static void PTRecCancelTapped(void);
 @end
 static PTRecBtnTarget *gRecBtnTarget = nil;
 
+// v1.0.15：录制覆盖层视图——局部交互：只有顶部按钮行(interactiveBar)能接收触摸，
+// 其余区域 hitTest 返回 nil 穿透到下层 App。
+// 此前整层 userInteractionEnabled=NO，而 iOS 命中测试会跳过 NO 视图整棵子树，
+// 导致「完成/取消」按钮也收不到触摸，点击穿透到 App 按不到。
+@interface PTRecOverlayView : UIView
+@property (nonatomic, weak) UIView *interactiveBar;
+@end
+@implementation PTRecOverlayView
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (self.interactiveBar && CGRectContainsPoint(self.interactiveBar.frame, point)) {
+        return [super hitTest:point withEvent:event];   // 按钮行内正常命中（按钮可点）
+    }
+    return nil;   // 按钮行以外 → 穿透到下层 App（实地滑动/点击录制不受影响）
+}
+@end
+
 static void PTRecOverlayTick(void) {
     NSArray *pts = PTRecCurrentPoints();
     if (!pts) return;
@@ -1574,8 +1590,8 @@ void PTRecShowOverlay(NSString *mode, NSString *planName, NSInteger editIndex, N
     gRecLastPts = (editIndex >= 0 && editAction) ? editAction[@"pts"] : nil;
     if (!gRecBtnTarget) gRecBtnTarget = [PTRecBtnTarget new];
 
-    UIView *ov = [[UIView alloc] initWithFrame:kw.bounds];
-    ov.userInteractionEnabled = NO;   // 关键：整体不拦截触摸 → 穿透到 App 实地操作
+    PTRecOverlayView *ov = [[PTRecOverlayView alloc] initWithFrame:kw.bounds];
+    ov.userInteractionEnabled = YES;   // v1.0.15：改局部交互——hitTest 只命中按钮行，其余穿透（见 PTRecOverlayView）
     ov.backgroundColor = [UIColor colorWithWhite:0 alpha:0.18];   // 半透明：能看到 App 内容
     [kw addSubview:ov];
     gRecOverlay = ov;
@@ -1589,6 +1605,7 @@ void PTRecShowOverlay(NSString *mode, NSString *planName, NSInteger editIndex, N
     bar.userInteractionEnabled = YES;
     bar.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.78];
     [ov addSubview:bar];
+    ov.interactiveBar = bar;   // v1.0.15：hitTest 局部命中范围（按钮行）
 
     gRecCancelBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     gRecCancelBtn.frame = CGRectMake(8, topInset + 10, 60, 36);
