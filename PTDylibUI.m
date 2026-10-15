@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.17）
+// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.19）
 //
 // 从 deb 版 RootListController.m（v1.0.43）移植，改造：
 //   · 基类 PSViewController/PSListController → UIViewController（不依赖 Preferences 框架）
@@ -177,7 +177,7 @@ static const double kConverge = 60.0;
 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
     if (s == 2) {
-        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.17\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，双指长按弹出本菜单。\n当前配置：%@",
+        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.19\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，双指长按弹出本菜单。\n当前配置：%@",
             PTDylibUsingDebConfig()
                 ? @"复用 deb 版配置（com.yourname.pageturner.plist），与 deb 插件数据互通"
                 : @"独立配置（未检测到 deb 配置，自建 com.yourname.pageturnerdylib.plist）"];
@@ -250,7 +250,7 @@ static const double kConverge = 60.0;
 - (void)switchToggled:(UISwitch *)sw {
     NSMutableDictionary *cfg = PTRead();
     if (sw.tag == 10) cfg[@"debugDots"] = @(sw.on);
-    else cfg[@"debugLogEnabled"] = @(sw.on);
+    else { cfg[@"debugLogEnabled"] = @(sw.on); PTDylibLogSetEnabled(sw.on); }   // v1.0.19：日志开关运行时即时生效
     PTWrite(cfg);
     [self.tableView reloadData];
 }

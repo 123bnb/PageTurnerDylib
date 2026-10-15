@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibMain.m —— PageTurnerDylib 入口（v1.0.17）
+// PTDylibMain.m —— PageTurnerDylib 入口（v1.0.19）
 //
 // 注入即生效：constructor → 主队列安装 hook。
 // v1.0.12：不再用手势识别器（会被 App 手势仲裁抢）——双指长按改由
@@ -56,6 +56,14 @@ void PTDylibShowMenu(void) {
         return;
     }
     UIWindow *w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    // v1.0.19：iOS13+ 窗口必须绑定 windowScene 才能渲染，否则菜单可能完全不显示
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]] &&
+            ((UIWindowScene *)scene).activationState == UISceneActivationStateForegroundActive) {
+            w.windowScene = (UIWindowScene *)scene;
+            break;
+        }
+    }
     w.windowLevel = UIWindowLevelAlert + 1;
     w.backgroundColor = [UIColor systemBackgroundColor];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[PTDylibMenuVC new]];
@@ -74,7 +82,7 @@ static void PTDylibInit(void) {
                 NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"?";
                 PTDylibInstallHooks();
                 PTDylibLog(@"==================================================");
-                PTDylibLog(@"PageTurnerDylib v1.0.17 已注入 %@ (pid=%d) 配置来源=%@",
+                PTDylibLog(@"PageTurnerDylib v1.0.19 已注入 %@ (pid=%d) 配置来源=%@",
                     bid, getpid(), PTDylibUsingDebConfig() ? @"复用deb配置" : @"独立配置");
                 PTDylibLog(@"配置路径=%@ 防抖=%.0fms 方案数=%lu",
                     PTDylibCfgPath(),

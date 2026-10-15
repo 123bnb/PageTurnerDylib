@@ -17,6 +17,7 @@ extern void PTDylibWriteCfg(NSDictionary *cfg);
 
 // ---------- 日志 ----------
 extern void PTDylibLog(NSString *fmt, ...);
+extern void PTDylibLogSetEnabled(BOOL on);   // v1.0.19：日志总开关运行时即时生效
 extern NSArray *PTDylibLogLines(void);   // 内存日志副本（日志页显示）
 
 // ---------- hook 装配 ----------
