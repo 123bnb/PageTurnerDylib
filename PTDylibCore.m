@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.17）
+// PTDylibCore.m —— PageTurnerDylib 运行端核心（v1.0.19）
 //
 // 从 deb 版 PageTurner v1.0.43 移植：
 //   · Tweak.xm 的运行拦截/匹配/执行/可视化（去掉 Preferences 进程分支、总开关、
@@ -42,7 +42,7 @@
 static NSString *kDylibPrefsName = @"com.yourname.pageturnerdylib.plist";
 static NSString *kDylibLogName = @"PageTurnerDylib.log";
 static const double kPagerWindowSec = 0.4;       // 翻页器活跃窗口（已学 sender 开窗）
-static const double kCollectWindowSec = 0.05;    // 学习/测试采集窗口（addEvent 刷新）
+static const double kCollectWindowSec = 0.30;    // v1.0.19：学习/测试采集窗口放宽到 0.3s，减少系统繁忙时丢样本、便于"特征已稳定"达成（原 0.05s 过短）
 static const double kTapDistThreshold = 30.0;    // 位移 <30pt 判定 tap
 static const double kDirTolerance = 15.0;        // 方向容差 ±15°
 static const double kDistSlack = 30.0;           // 位移区间匹配裕度
@@ -110,8 +110,9 @@ static void PTDylibLogRefreshCfg(void) {
 }
 
 void PTDylibLog(NSString *fmt, ...) {
-    PTDylibLogRefreshCfg();
+    // v1.0.19：关日志即零 IO——直接返回，不再读 plist/写文件。开启时才按 mtime 探测运行时切换。
     if (!sLogEnabled) return;
+    PTDylibLogRefreshCfg();
     if (!sLogLines) sLogLines = [NSMutableArray array];
     va_list ap; va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
@@ -141,6 +142,11 @@ void PTDylibLog(NSString *fmt, ...) {
 
 NSArray *PTDylibLogLines(void) {
     return sLogLines ? [sLogLines copy] : @[];
+}
+
+// v1.0.19：日志总开关运行时即时生效（菜单开关调用）；关日志后 PTDylibLog 直接返回，零 IO。
+void PTDylibLogSetEnabled(BOOL on) {
+    sLogEnabled = on;
 }
 
 double PTNowC(void) {
@@ -1428,6 +1434,7 @@ void PTDylibInstallHooks(void) {
     static dispatch_once_t on;
     dispatch_once(&on, ^{
         @autoreleasepool {
+            PTDylibLogRefreshCfg();   // v1.0.19：启动时从配置种子 sLogEnabled（关日志后 PTDylibLog 不再每次读 plist）
             void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
             if (iokit) {
                 pGetType = (IOHIDEventGetType_t)dlsym(iokit, "IOHIDEventGetType");
@@ -1435,8 +1442,17 @@ void PTDylibInstallHooks(void) {
                 pGetFloat = (IOHIDEventGetFloatValue_t)dlsym(iokit, "IOHIDEventGetFloatValue");
             }
             Class addCls = NSClassFromString(@"_UIUpdateHIDDigitizerInput");
+            if (!addCls) {
+                // v1.0.19：私有类不存在（当前 iOS 版本可能已改名）→ 拦截完全失效，必须醒目提示
+                NSLog(@"[PageTurnerDylib][严重] 核心钩子失败：私有类 _UIUpdateHIDDigitizerInput 不存在，翻页器输入拦截将完全失效（当前 iOS 可能已改名该私有类）。");
+                PTDylibLog(@"[严重][核心钩子] 私有类 _UIUpdateHIDDigitizerInput 不存在 → 拦截失效");
+            }
             SEL addSel = sel_registerName("addEvent:");
             Method am = addCls ? class_getInstanceMethod(addCls, addSel) : NULL;
+            if (addCls && !am) {
+                NSLog(@"[PageTurnerDylib][严重] 核心钩子失败：_UIUpdateHIDDigitizerInput 缺少 addEvent: 方法，翻页器输入拦截将完全失效。");
+                PTDylibLog(@"[严重][核心钩子] _UIUpdateHIDDigitizerInput 缺少 addEvent: 方法 → 拦截失效");
+            }
             if (am) { gOrigAddEvent = method_getImplementation(am); method_setImplementation(am, (IMP)PTDylibAddEvent); }
 
             Class appCls = NSClassFromString(@"UIApplication");
@@ -1447,6 +1463,12 @@ void PTDylibInstallHooks(void) {
             BOOL ok = (gOrigAddEvent != NULL && gOrigSendEvent != NULL && pGetType != NULL && pGetSender != NULL);
             PTDylibLog(@"PTDylibInstallHooks: ok=%d addEvent=%d sendEvent=%d getType=%d getSender=%d",
                 ok, gOrigAddEvent != NULL, gOrigSendEvent != NULL, pGetType != NULL, pGetSender != NULL);
+            if (!ok) {
+                // v1.0.19：单点失败兜底——任一核心符号缺失都导致功能静默失效，强制进 syslog 让用户可见
+                NSLog(@"[PageTurnerDylib][严重] PTDylibInstallHooks 部分失败 ok=%d（addEvent=%d sendEvent=%d getType=%d getSender=%d）。翻页器拦截可能不工作，请核对当前 iOS 版本与私有 API 兼容性！",
+                    ok, gOrigAddEvent != NULL, gOrigSendEvent != NULL, pGetType != NULL, pGetSender != NULL);
+                PTDylibLog(@"[严重][核心钩子] 安装部分失败 ok=%d → 拦截可能不工作，核对 iOS 私有 API 兼容性", ok);
+            }
         }
     });
 }
