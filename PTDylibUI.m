@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.15）
+// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.16）
 //
 // 从 deb 版 RootListController.m（v1.0.43）移植，改造：
 //   · 基类 PSViewController/PSListController → UIViewController（不依赖 Preferences 框架）
@@ -177,7 +177,7 @@ static const double kConverge = 60.0;
 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
     if (s == 2) {
-        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.15\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，双指长按弹出本菜单。\n当前配置：%@",
+        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.16\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，双指长按弹出本菜单。\n当前配置：%@",
             PTDylibUsingDebConfig()
                 ? @"复用 deb 版配置（com.yourname.pageturner.plist），与 deb 插件数据互通"
                 : @"独立配置（未检测到 deb 配置，自建 com.yourname.pageturnerdylib.plist）"];
@@ -1600,7 +1600,15 @@ void PTRecShowOverlay(NSString *mode, NSString *planName, NSInteger editIndex, N
     // v1.0.14：按钮行下移到顶部安全区以下——此前从 y=0 开始，灵动岛机型按钮被灵动岛挡住按不到
     CGFloat w = kw.bounds.size.width;
     CGFloat h = kw.bounds.size.height;
-    CGFloat topInset = MAX(kw.safeAreaInsets.top, 20.0);   // 灵动岛≈54-59pt，刘海≈44pt，无刘海≈20pt
+    // v1.0.16：安全区取最大兜底——注入环境下 keyWindow.safeAreaInsets.top 可能返回 0
+    // （导致按钮行仍被灵动岛盖住、按钮与横幅错位），用状态栏高度兜底：
+    // 灵动岛机型 statusBar≈54pt、刘海≈47pt、无刘海≈20pt
+    CGFloat topInset = kw.safeAreaInsets.top;
+    CGFloat statusH = [UIApplication sharedApplication].statusBarFrame.size.height;
+    if (topInset < statusH) topInset = statusH;
+    if (topInset < 20) topInset = 20;
+    PTDylibLog(@"[录制] 布局：safeAreaTop=%.0f statusH=%.0f → topInset=%.0f (bar y=%.0f~%.0f 按钮 y=%.0f~%.0f)",
+        kw.safeAreaInsets.top, statusH, topInset, topInset, topInset + 56, topInset + 10, topInset + 46);
     UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, topInset, w, 56)];
     bar.userInteractionEnabled = YES;
     bar.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.78];
@@ -1624,7 +1632,7 @@ void PTRecShowOverlay(NSString *mode, NSString *planName, NSInteger editIndex, N
     [bar addSubview:gRecDoneBtn];
 
     UILabel *barTip = [[UILabel alloc] initWithFrame:CGRectMake(76, topInset + 12, w - 152, 32)];
-    barTip.text = @"按钮行以下为录制区，实地滑动/点击即录制";
+    barTip.text = @"v1.0.16｜按钮行以下为录制区";   // v1.0.16：带版本号，便于确认加载的是新版
     barTip.font = [UIFont systemFontOfSize:12];
     barTip.textColor = [UIColor whiteColor];
     barTip.textAlignment = NSTextAlignmentCenter;
@@ -1647,7 +1655,7 @@ void PTRecShowOverlay(NSString *mode, NSString *planName, NSInteger editIndex, N
         gRecTip.text = [NSString stringWithFormat:@"%@\n已录 %lu 点，可重录\n完成按钮保存覆盖",
             modeName, (unsigned long)gRecLastPts.count];
     } else {
-        gRecTip.text = [NSString stringWithFormat:@"%@\n在按钮行下方实地操作：\n滑动 = 录滑动轨迹\n点击/双击 = 录点击位置", modeName];
+        gRecTip.text = [NSString stringWithFormat:@"%@\n本卡片仅提示，可穿透\n顶部「取消/完成」可点击\n在按钮行下方实地滑动 = 录轨迹", modeName];
     }
     [ov addSubview:gRecTip];
 
