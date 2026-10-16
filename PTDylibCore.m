@@ -13,6 +13,10 @@
 //   · 配置：有 deb 版配置（com.yourname.pageturner.plist 5 候选路径）就复用；
 //     没有则自建独立配置 com.yourname.pageturnerdylib.plist
 //   · 日志：统一 PTDylibLog（内存 200 条 + 文件 PageTurnerDylib.log 1000 行循环）
+// v1.0.20（本次变更，与 deb 版 v1.0.55 同步）：
+//   · 【滑动(手动)】录制改为覆盖层 UIPanGestureRecognizer 抓真实轨迹（照搬 DirectVolumeTap），
+//     不再穿透到 App、不再用 sendEvent 全局采集；半透明黑 0.4 背景仍透出 App。
+//   · 【滑动(手动)】回放改用 CADisplayLink + 二分时间插值（照搬 DVTFakeSwipe），更顺滑跟手、对齐 VSync。
 // ============================================================
 
 #import <UIKit/UIKit.h>
@@ -911,52 +915,20 @@ static BOOL gInFakeTouch = NO;
 static int gExecToken = 0;
 static double gLastExec = 0;
 
-// v1.0.8：手动滑动录制（滑动(手动)动作）——录手指真实轨迹，回放按轨迹注入
-// v1.0.12：支持 点击(手动)/双击(手动)——录真实点击坐标+时间戳
-static BOOL gRecArmed = NO;                 // 录制覆盖层打开
-static NSString *gRecMode = nil;            // recSwipe / tapManual / doubleTapManual
-static double gRecTopY = 0;                 // 录制区上边界（完成按钮行往下，窗口坐标）
-static NSMutableArray *gRecPts = nil;       // 当前轨迹点 @{x,y,t(相对起点毫秒)}
-static double gRecT0 = 0;
-static BOOL gRecActive = NO;                // 正在录一次触摸序列
-static int gRecTaps = 0;                    // doubleTapManual 已录点击次数
-static void (^gRecDone)(NSArray *) = nil;
+// v1.0.8：手动滑动录制（滑动(手动)动作）——v1.0.20 起录制改为覆盖层 UIPanGestureRecognizer 抓取
+// （见 PTDylibUI.m 的 PTRecOnPan），不再用 sendEvent 钩子全局采集（旧版穿透到 App 抓真实触摸）。
+// 此处仅保留 PTRecStart/PTRecStop 开关 + gRecArmed 守卫（供双指检测等处排除录制态）。
+static BOOL gRecArmed = NO;                 // 录制覆盖层打开（PTDylibUI/PTRecShowOverlay 控制）
+static void (^gRecDone)(NSArray *) = nil;    // 录制完成回调（UI 传入；UI 端用同块 gRecDoneUI）
 
 void PTRecStart(NSString *mode, double topY, void (^done)(NSArray *pts)) {
-    gRecMode = mode ?: @"recSwipe";
-    gRecTopY = topY;
-    gRecDone = done;
-    gRecPts = nil;
-    gRecActive = NO;
-    gRecTaps = 0;
     gRecArmed = YES;
+    gRecDone = done;
 }
 
 void PTRecStop(void) {
     gRecArmed = NO;
-    gRecActive = NO;
-    gRecTaps = 0;
-    gRecPts = nil;
     gRecDone = nil;
-    gRecMode = nil;
-}
-
-// v1.0.10：录制页实时画轨迹用（主线程调用，返回当前轨迹副本）
-NSArray *PTRecCurrentPoints(void) {
-    if (!gRecArmed || !gRecPts) return nil;
-    return [NSArray arrayWithArray:gRecPts];
-}
-
-// v1.0.12：点击/双击录制完成判定（tapManual=1 次点击，doubleTapManual=2 次）
-static void PTRecFinishIfDone(void) {
-    if (!gRecArmed || !gRecActive || !gRecPts) return;
-    int need = [gRecMode isEqualToString:@"doubleTapManual"] ? 2 : 1;
-    if (gRecTaps >= need) {
-        gRecActive = NO;
-        NSArray *pts = gRecPts;
-        gRecPts = nil;
-        if (gRecDone) { gRecDone(pts); }
-    }
 }
 
 // 未命中：暂存轨迹重放给 App
@@ -1094,31 +1066,75 @@ static void PTFakeSwipeAsync(CGPoint from, CGPoint to, double durationMs, int ho
     });
 }
 
-// v1.0.8：手动滑动回放——按录制轨迹逐点注入（保持录制时间间隔，最短 8ms 防风暴）
+// v1.0.55：滑动(手动)回放（CADisplayLink 驱动，照搬 DirectVolumeTap 的 DVTFakeSwipe）
+// 每帧对齐 VSync，按真实经过时间插值出坐标注入一次 Moved，1:1 还原真实手指流畅感。
+// pts 为 @{x,y,t} 字典（与录制/设置页/测试一致）。
+@interface PTRecSwipeTickProxy : NSObject
+@property (nonatomic, copy) void (^tick)(void);
+- (void)onTick:(CADisplayLink *)link;
+@end
+@implementation PTRecSwipeTickProxy
+- (void)onTick:(CADisplayLink *)link { if (_tick) _tick(); }
+@end
+
+// 按时间线性插值取坐标（二分定位区间）
+static CGPoint PTRecSwipeInterp(NSArray *xs, NSArray *ys, NSArray *ts, double targetT) {
+    NSUInteger m = [ts count];
+    if (m == 0) return CGPointZero;
+    double t0 = [ts[0] doubleValue], tEnd = [ts[m-1] doubleValue];
+    if (targetT <= t0)   return CGPointMake([xs[0] doubleValue], [ys[0] doubleValue]);
+    if (targetT >= tEnd) return CGPointMake([xs[m-1] doubleValue], [ys[m-1] doubleValue]);
+    NSUInteger lo = 0, hi = m - 1;
+    while (hi - lo > 1) {
+        NSUInteger mid = (lo + hi) / 2;
+        if ([ts[mid] doubleValue] <= targetT) lo = mid; else hi = mid;
+    }
+    double ta = [ts[lo] doubleValue], tb = [ts[hi] doubleValue];
+    double fa = [xs[lo] doubleValue], fb = [xs[hi] doubleValue];
+    double ga = [ys[lo] doubleValue], gb = [ys[hi] doubleValue];
+    double f = (tb - ta) > 1e-6 ? (targetT - ta) / (tb - ta) : 0.0;
+    return CGPointMake(fa + (fb - fa) * f, ga + (gb - ga) * f);
+}
+
 static void PTFakeRecSwipeAsync(NSArray *pts, int token, void (^done)(void)) {
     if (!pts.count) { if (done) done(); return; }
+    // 预解析 @{x,y,t} → 分离数组（避免每帧反复解包）
+    NSMutableArray *xs = [NSMutableArray array], *ys = [NSMutableArray array], *ts = [NSMutableArray array];
+    for (NSDictionary *p in pts) {
+        [xs addObject:@([p[@"x"] doubleValue])];
+        [ys addObject:@([p[@"y"] doubleValue])];
+        [ts addObject:@([p[@"t"] doubleValue])];
+    }
+    NSUInteger m = ts.count;
+    if (m < 2) { if (done) done(); return; }
+    double t0 = [ts[0] doubleValue];
+    double totalMs = [ts[m-1] doubleValue] - t0;
+    if (totalMs <= 0) totalMs = 1.0;
+
     __block NSInteger pid = -1;
-    __block int idx = 0;
-    __block void (^step)(void);
-    step = ^(void) {
-        if (token != gExecToken) { if (done) done(); return; }
-        if (idx >= (int)pts.count) { if (done) done(); return; }
-        NSDictionary *pt = pts[idx];
-        CGPoint p = CGPointMake([pt[@"x"] doubleValue], [pt[@"y"] doubleValue]);
-        UITouchPhase ph = (idx == 0) ? UITouchPhaseBegan
-                        : ((idx == (int)pts.count - 1) ? UITouchPhaseEnded : UITouchPhaseMoved);
+    __block BOOL ended = NO;
+    __block CFAbsoluteTime startT = CFAbsoluteTimeGetCurrent();
+    PTRecSwipeTickProxy *proxy = [PTRecSwipeTickProxy new];
+    CADisplayLink *link = [CADisplayLink displayLinkWithTarget:proxy selector:@selector(onTick:)];
+    [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    proxy.tick = ^{
+        if (token != gExecToken) { [link invalidate]; if (done) done(); return; }
+        double elapsedMs = (CFAbsoluteTimeGetCurrent() - startT) * 1000.0;
+        CGPoint cur = PTRecSwipeInterp(xs, ys, ts, t0 + elapsedMs);   // 1:1 还原（无速率调节）
         gInFakeTouch = YES;
-        if (idx == 0) pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:p withTouchPhase:ph];
-        else [PTFakeMetaTouch fakeTouchId:pid AtPoint:p withTouchPhase:ph];
+        if (pid < 0) pid = [PTFakeMetaTouch fakeTouchId:1 AtPoint:cur withTouchPhase:UITouchPhaseBegan];
+        else         [PTFakeMetaTouch fakeTouchId:pid AtPoint:cur withTouchPhase:UITouchPhaseMoved];
         gInFakeTouch = NO;
-        idx++;
-        if (idx >= (int)pts.count) { if (done) done(); return; }
-        double waitMs = [pts[idx][@"t"] doubleValue] - [pt[@"t"] doubleValue];
-        if (waitMs < 8) waitMs = 8;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(waitMs * NSEC_PER_SEC / 1000)),
-                       dispatch_get_main_queue(), step);
+        if (elapsedMs >= totalMs && !ended) {
+            CGPoint end = CGPointMake([xs[m-1] doubleValue], [ys[m-1] doubleValue]);
+            gInFakeTouch = YES;
+            [PTFakeMetaTouch fakeTouchId:pid AtPoint:end withTouchPhase:UITouchPhaseEnded];
+            gInFakeTouch = NO;
+            ended = YES;
+            [link invalidate];
+            if (done) done();
+        }
     };
-    step();
 }
 
 // 执行单条动作 → 完成后 next()
@@ -1289,85 +1305,9 @@ static void PTDylibSendEvent(id self, SEL _cmd, UIEvent *event) {
             PTDebugUpdate((__bridge void *)t, p, t.phase, NO);
         }
     }
-    // v1.0.8：手动滑动录制——手指在录制区（完成按钮行往下）内的真实轨迹，
-    // Began 在录制区才算开始，抬起/超时 5s 结束回调（v1.0.12：按模式区分滑动/点击/双击）
-    if (gRecArmed && event && !gInFakeTouch) {
-        NSSet *touches = [event respondsToSelector:@selector(allTouches)] ? event.allTouches : nil;
-        UITouch *t = [touches anyObject];
-        if (t) {
-            CGPoint p = t.window ? [t locationInView:t.window] : [t locationInView:t.view];
-            BOOL isTapMode = [gRecMode isEqualToString:@"tapManual"] || [gRecMode isEqualToString:@"doubleTapManual"];
-            switch (t.phase) {
-                case UITouchPhaseBegan: {
-                    if (gRecActive) break;   // 已在录（多指）：忽略第二根
-                    if (p.y >= gRecTopY) {
-                        if (!gRecPts) {
-                            gRecPts = [NSMutableArray array];
-                            gRecT0 = CACurrentMediaTime();
-                        }
-                        gRecActive = YES;
-                        if (isTapMode) {
-                            // 点击/双击：记录按下点（一次点击一个点）
-                            double tms = (CACurrentMediaTime() - gRecT0) * 1000.0;
-                            [gRecPts addObject:@{@"x": @(p.x), @"y": @(p.y), @"t": @(tms)}];
-                            gRecTaps++;
-                            // 超时兜底：双指点击第二下一直不来 → 5s 完成
-                            NSMutableArray *curPts = gRecPts;
-                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
-                                           dispatch_get_main_queue(), ^{
-                                if (gRecArmed && gRecActive && gRecPts == curPts) {
-                                    gRecActive = NO;
-                                    NSArray *pts = gRecPts;
-                                    gRecPts = nil;
-                                    gRecTaps = 0;
-                                    if (gRecDone) { gRecDone(pts); }
-                                }
-                            });
-                        } else {
-                            // 滑动：记录起点
-                            [gRecPts addObject:@{@"x": @(p.x), @"y": @(p.y), @"t": @(0)}];
-                            NSMutableArray *curPts = gRecPts;
-                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
-                                           dispatch_get_main_queue(), ^{
-                                if (gRecActive && gRecPts == curPts) {   // 还是同一次滑动（用户按着不放）
-                                    gRecActive = NO;
-                                    NSArray *pts = gRecPts;
-                                    gRecPts = nil;
-                                    if (gRecDone) { gRecDone(pts); }   // v1.0.10：不置 nil——录制页生命周期内可多次重录，PTRecStop 统一清理
-                                }
-                            });
-                        }
-                    } else {
-                        gRecActive = NO;   // 点在按钮行：不录
-                    }
-                    break;
-                }
-                case UITouchPhaseMoved: {
-                    if (gRecActive && gRecPts && !isTapMode) {
-                        double tms = (CACurrentMediaTime() - gRecT0) * 1000.0;
-                        [gRecPts addObject:@{@"x": @(p.x), @"y": @(p.y), @"t": @(tms)}];
-                    }
-                    break;
-                }
-                case UITouchPhaseEnded:
-                case UITouchPhaseCancelled: {
-                    if (gRecActive && gRecPts) {
-                        if (isTapMode) {
-                            gRecActive = NO;   // 松开一次点击，等第二次（双击）
-                            PTRecFinishIfDone();   // 点击完成一次，双击需两次
-                        } else {
-                            gRecActive = NO;
-                            NSArray *pts = gRecPts;
-                            gRecPts = nil;
-                            if (gRecDone) { gRecDone(pts); }
-                        }
-                    }
-                    break;
-                }
-                default: break;
-            }
-        }
-    }
+    // v1.0.20：已删除「sendEvent 钩子全局采集录制」——旧版录制覆盖层穿透到 App、靠全局 sendEvent 抓真实触摸。
+    // 现改为覆盖层 UIPanGestureRecognizer 直接抓轨迹（见 PTDylibUI.m PTRecOnPan），不再在此处采集。
+    // gRecArmed 仍保留（上方双指检测等处用其排除录制态）。
     // 注入触摸/执行中：放行（注入触摸没有 addEvent、sender 残留翻页器，走拦截会把映射触摸 Began 吞掉）
     if (gInFakeTouch || gIsInjecting || sTestInjecting) {
         if (gOrigSendEvent) ((void (*)(id, SEL, UIEvent *))gOrigSendEvent)(self, _cmd, event);

@@ -5,12 +5,19 @@ on:
     branches: [ main ]
     tags: [ 'v*' ]
 
+# 约束：同一版本（git ref / tag）同时只能有一个构建在跑；
+# 同版本再次触发会取消较早的运行，保证“一个版本一个 Actions”。
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
 jobs:
   build:
     runs-on: macos-latest
+    timeout-minutes: 20   # 注：GitHub 超时最小单位为 1 分钟，10 秒不可设；本构建需数分钟，设 20 兜底
     steps:
       - name: Checkout
         uses: actions/checkout@v4

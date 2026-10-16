@@ -1,5 +1,5 @@
 // ============================================================
-// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.19）
+// PTDylibUI.m —— PageTurnerDylib 设置 UI（v1.0.20）
 //
 // 从 deb 版 RootListController.m（v1.0.43）移植，改造：
 //   · 基类 PSViewController/PSListController → UIViewController（不依赖 Preferences 框架）
@@ -177,7 +177,7 @@ static const double kConverge = 60.0;
 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
     if (s == 2) {
-        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.19\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，双指长按弹出本菜单。\n当前配置：%@",
+        return [NSString stringWithFormat:@"PageTurnerDylib v1.0.20\n独立版 · 注入即生效（无总开关）：把 PageTurnerDylib.dylib 用巨魔注入器注入任意 App，双指长按弹出本菜单。\n当前配置：%@",
             PTDylibUsingDebConfig()
                 ? @"复用 deb 版配置（com.yourname.pageturner.plist），与 deb 插件数据互通"
                 : @"独立配置（未检测到 deb 配置，自建 com.yourname.pageturnerdylib.plist）"];
@@ -1448,26 +1448,30 @@ static const double kConverge = 60.0;
 // 提示字放录制区中心当背景字（v1.0.9：不被灵动岛遮挡，不拦截滑动）
 // ============================================================
 // ============================================================
-// 手动录制覆盖层（v1.0.12）
-// 关菜单 → 在 keyWindow 上叠半透明覆盖层（不拦截触摸，穿透到 App 实地操作）→
-// 顶部"取消/完成"按钮行（56pt）以下为录制区 → 手指滑动/点击即被记录 →
-// 完成保存动作（滑动(手动)/点击(手动)/双击(手动)）
+// 手动录制覆盖层（v1.0.12 起；v1.0.20 改 UIPanGestureRecognizer 抓轨迹，不再穿透到 App）
+// 关菜单 → 在 keyWindow 上叠半透明覆盖层（整层吃触摸，UIPanGestureRecognizer 抓真实滑动）→
+// 顶部"取消/完成"按钮行（56pt）以下为录制区 → 手指滑一道即被记录 →
+// 松手完成 → 保存动作（滑动(手动)）
 // ============================================================
 static UIView *gRecOverlay = nil;
 static UIButton *gRecDoneBtn = nil;
 static UIButton *gRecCancelBtn = nil;
 static UILabel *gRecTip = nil;
 static CAShapeLayer *gRecTrailLayer = nil;
-static NSTimer *gRecTimer = nil;
-static int gRecDrawnCount = -1;
 static NSString *gRecMode = nil;
 static NSString *gRecPlanName = nil;
 static NSInteger gRecEditIndex = -1;
 static NSDictionary *gRecEditAction = nil;
 static NSArray *gRecLastPts = nil;
+// v1.0.20：录制改为覆盖层 UIPanGestureRecognizer 抓真实轨迹（DVT 式，无穿透）——以下为录制态
+static NSMutableArray *gRecCurrentPts = nil;   // 当前正在录的 @{x,y,t} 字典（对照 DVT currentRecording）
+static CFAbsoluteTime gRecT0 = 0;
+static double gRecTopY = 0;                     // 按钮行下缘（窗口坐标）：该区域内不录（防误触按钮行）
+static void (^gRecDoneUI)(NSArray *) = nil;     // 录制完成回调（UI 端，更新 tip + gRecLastPts）
 
 // 前置声明（覆盖层函数在 target/菜单中使用）
-static void PTRecOverlayTick(void);
+static void PTRecDrawTrail(void);
+static void PTRecOnPan(UIPanGestureRecognizer *pan);
 static void PTRecDoneTapped(void);
 static void PTRecCancelTapped(void);
 
@@ -1477,40 +1481,52 @@ static void PTRecCancelTapped(void);
 @implementation PTRecBtnTarget
 - (void)doneTapped { PTRecDoneTapped(); }
 - (void)cancelTapped { PTRecCancelTapped(); }
-- (void)overlayTick { PTRecOverlayTick(); }
+- (void)onRecPan:(UIPanGestureRecognizer *)pan { PTRecOnPan(pan); }
 @end
 static PTRecBtnTarget *gRecBtnTarget = nil;
 
-// v1.0.15：录制覆盖层视图——局部交互：只有顶部按钮行(interactiveBar)能接收触摸，
-// 其余区域 hitTest 返回 nil 穿透到下层 App。
-// 此前整层 userInteractionEnabled=NO，而 iOS 命中测试会跳过 NO 视图整棵子树，
-// 导致「完成/取消」按钮也收不到触摸，点击穿透到 App 按不到。
-@interface PTRecOverlayView : UIView
-@property (nonatomic, weak) UIView *interactiveBar;
-@end
-@implementation PTRecOverlayView
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    if (self.interactiveBar && CGRectContainsPoint(self.interactiveBar.frame, point)) {
-        return [super hitTest:point withEvent:event];   // 按钮行内正常命中（按钮可点）
-    }
-    return nil;   // 按钮行以外 → 穿透到下层 App（实地滑动/点击录制不受影响）
-}
-@end
+// v1.0.20：录制覆盖层不再做穿透 hitTest——改为整层 userInteractionEnabled=YES 吃触摸，
+// 由 UIPanGestureRecognizer 直接抓取真实滑动轨迹（照搬 DirectVolumeTap 滑动模式）。
+// 半透明黑 0.4 背景透出 App；按钮行内误触已在 PTRecOnPan 中排除。
 
-static void PTRecOverlayTick(void) {
-    NSArray *pts = PTRecCurrentPoints();
-    if (!pts) return;
-    if ((int)pts.count == gRecDrawnCount) return;
-    gRecDrawnCount = (int)pts.count;
+// v1.0.20：实时画录制轨迹（从 gRecCurrentPts 重建路径，替代旧 PTRecOverlayTick）
+static void PTRecDrawTrail(void) {
+    if (!gRecTrailLayer) return;
     CGMutablePathRef path = CGPathCreateMutable();
-    for (int i = 0; i < (int)pts.count; i++) {
-        NSDictionary *pt = pts[i];
+    for (NSUInteger i = 0; i < gRecCurrentPts.count; i++) {
+        NSDictionary *pt = gRecCurrentPts[i];
         CGPoint p = CGPointMake([pt[@"x"] doubleValue], [pt[@"y"] doubleValue]);
         if (i == 0) CGPathMoveToPoint(path, NULL, p.x, p.y);
         else CGPathAddLineToPoint(path, NULL, p.x, p.y);
     }
     gRecTrailLayer.path = path;
     CGPathRelease(path);
+}
+
+// v1.0.20：DVT 式录制——覆盖层 pan 抓真实轨迹（3px 阈值降采样），松手提交
+static void PTRecOnPan(UIPanGestureRecognizer *pan) {
+    if (!gRecOverlay) return;
+    CGPoint loc = [pan locationInView:gRecOverlay];
+    if (pan.state == UIGestureRecognizerStateBegan) {
+        if (loc.y < gRecTopY) { gRecCurrentPts = nil; return; }   // 按钮行内误触：不录
+        gRecCurrentPts = [NSMutableArray array];
+        gRecT0 = CFAbsoluteTimeGetCurrent();
+        [gRecCurrentPts addObject:@{@"x": @(loc.x), @"y": @(loc.y), @"t": @0}];
+    } else if (pan.state == UIGestureRecognizerStateChanged) {
+        if (!gRecCurrentPts) return;
+        NSDictionary *last = gRecCurrentPts.lastObject;
+        CGPoint lp = CGPointMake([last[@"x"] doubleValue], [last[@"y"] doubleValue]);
+        if (hypot(loc.x - lp.x, loc.y - lp.y) >= 3.0f) {
+            double tms = (CFAbsoluteTimeGetCurrent() - gRecT0) * 1000.0;
+            [gRecCurrentPts addObject:@{@"x": @(loc.x), @"y": @(loc.y), @"t": @(tms)}];
+            PTRecDrawTrail();
+        }
+    } else if (pan.state == UIGestureRecognizerStateEnded || pan.state == UIGestureRecognizerStateCancelled) {
+        if (gRecCurrentPts.count >= 2) {
+            PTRecDrawTrail();
+            if (gRecDoneUI) gRecDoneUI([gRecCurrentPts copy]);   // 更新 tip + gRecLastPts
+        }
+    }
 }
 
 static void PTRecSaveAction(void) {
@@ -1538,7 +1554,6 @@ static void PTRecSaveAction(void) {
 }
 
 static void PTRecHideOverlay(void) {
-    [gRecTimer invalidate]; gRecTimer = nil;
     PTRecStop();
     [gRecOverlay removeFromSuperview];
     gRecOverlay = nil;
@@ -1547,7 +1562,7 @@ static void PTRecHideOverlay(void) {
     gRecMode = nil; gRecPlanName = nil;
     gRecEditIndex = -1; gRecEditAction = nil;
     gRecLastPts = nil;
-    gRecDrawnCount = -1;
+    gRecCurrentPts = nil; gRecDoneUI = nil;
 }
 
 static void PTRecDoneTapped(void) {
@@ -1579,7 +1594,7 @@ void PTRecMigrateOverlay(void) {
     [kw addSubview:gRecOverlay];
 }
 
-// v1.0.12：打开手动录制覆盖层（mode=recSwipe/tapManual/doubleTapManual）
+// v1.0.12：打开手动录制覆盖层（v1.0.14 起仅 recSwipe；v1.0.20 改 UIPanGestureRecognizer 抓轨迹，无穿透）
 void PTRecShowOverlay(NSString *mode, NSString *planName, NSInteger editIndex, NSDictionary *editAction) {
     if (gRecOverlay) PTRecHideOverlay();
     PTDylibCloseMenu();   // 关菜单，覆盖层才能叠到 App keyWindow 上
@@ -1590,9 +1605,9 @@ void PTRecShowOverlay(NSString *mode, NSString *planName, NSInteger editIndex, N
     gRecLastPts = (editIndex >= 0 && editAction) ? editAction[@"pts"] : nil;
     if (!gRecBtnTarget) gRecBtnTarget = [PTRecBtnTarget new];
 
-    PTRecOverlayView *ov = [[PTRecOverlayView alloc] initWithFrame:kw.bounds];
-    ov.userInteractionEnabled = YES;   // v1.0.15：改局部交互——hitTest 只命中按钮行，其余穿透（见 PTRecOverlayView）
-    ov.backgroundColor = [UIColor colorWithWhite:0 alpha:0.18];   // 半透明：能看到 App 内容
+    UIView *ov = [[UIView alloc] initWithFrame:kw.bounds];
+    ov.userInteractionEnabled = YES;                       // v1.0.20：整层吃触摸（无穿透）——DVT 式手势抓取
+    ov.backgroundColor = [UIColor colorWithWhite:0 alpha:0.4];   // 半透明黑 0.4：透出 App（DVT 同款）
     [kw addSubview:ov];
     gRecOverlay = ov;
 
@@ -1607,13 +1622,13 @@ void PTRecShowOverlay(NSString *mode, NSString *planName, NSInteger editIndex, N
     CGFloat statusH = [UIApplication sharedApplication].statusBarFrame.size.height;
     if (topInset < statusH) topInset = statusH;
     if (topInset < 20) topInset = 20;
+    gRecTopY = topInset + 56.0;   // 按钮行下缘：该区域内不录（防误触按钮行）
     PTDylibLog(@"[录制] 布局：safeAreaTop=%.0f statusH=%.0f → topInset=%.0f (bar y=%.0f~%.0f 按钮 y=%.0f~%.0f)",
-        kw.safeAreaInsets.top, statusH, topInset, topInset, topInset + 56, topInset + 10, topInset + 46);
+        kw.safeAreaInsets.top, statusH, topInset, topInset, gRecTopY, topInset + 10, topInset + 46);
     UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, topInset, w, 56)];
     bar.userInteractionEnabled = YES;
     bar.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.78];
     [ov addSubview:bar];
-    ov.interactiveBar = bar;   // v1.0.15：hitTest 局部命中范围（按钮行）
 
     gRecCancelBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     gRecCancelBtn.frame = CGRectMake(8, 10, 60, 36);   // v1.0.17：bar 内相对坐标（此前误用 topInset+10 导致按钮溢出 bar 底部渲染在横幅下方）
@@ -1632,7 +1647,7 @@ void PTRecShowOverlay(NSString *mode, NSString *planName, NSInteger editIndex, N
     [bar addSubview:gRecDoneBtn];
 
     UILabel *barTip = [[UILabel alloc] initWithFrame:CGRectMake(76, 12, w - 152, 32)];   // v1.0.17：bar 内相对坐标
-    barTip.text = @"v1.0.17｜按钮行以下为录制区";   // v1.0.16：带版本号，便于确认加载的是新版
+    barTip.text = @"v1.0.20｜全屏可滑，松手录完";   // 带版本号，便于确认加载的是新版
     barTip.font = [UIFont systemFontOfSize:12];
     barTip.textColor = [UIColor whiteColor];
     barTip.textAlignment = NSTextAlignmentCenter;
@@ -1650,37 +1665,43 @@ void PTRecShowOverlay(NSString *mode, NSString *planName, NSInteger editIndex, N
     gRecTip.layer.masksToBounds = YES;
     gRecTip.backgroundColor = [UIColor colorWithWhite:0 alpha:0.35];
     NSString *modeName = [mode isEqualToString:@"tapManual"] ? @"点击(手动)"
-                        : ([mode isEqualToString:@"doubleTapManual"] ? @"双击(手动)" : @"滑动(手动)");
+                        : ([mode isEqualToString:@"doubleTapManual"] ? @"双击(手动)" : @"滑动(手动)"];
     if (gRecLastPts.count) {
         gRecTip.text = [NSString stringWithFormat:@"%@\n已录 %lu 点，可重录\n完成按钮保存覆盖",
             modeName, (unsigned long)gRecLastPts.count];
     } else {
-        gRecTip.text = [NSString stringWithFormat:@"%@\n本卡片仅提示，可穿透\n顶部「取消/完成」可点击\n在按钮行下方实地滑动 = 录轨迹", modeName];
+        gRecTip.text = [NSString stringWithFormat:@"%@\n在区域内用手指滑一道，松手即录完\n顶部「取消/完成」可点击", modeName];
     }
     [ov addSubview:gRecTip];
 
-    // 轨迹线
+    // 轨迹线（蓝，lineWidth 6，DVT/deb 同款）
     gRecTrailLayer = [CAShapeLayer layer];
     gRecTrailLayer.strokeColor = [UIColor systemBlueColor].CGColor;
     gRecTrailLayer.fillColor = [UIColor clearColor].CGColor;
-    gRecTrailLayer.lineWidth = 3;
+    gRecTrailLayer.lineWidth = 6;
     gRecTrailLayer.lineJoin = kCALineJoinRound;
     [ov.layer addSublayer:gRecTrailLayer];
 
-    // 开始录制：topY=按钮行下缘（安全区顶+56，窗口坐标），录制区=按钮行往下
-    gRecDrawnCount = -1;
-    __weak __block UIView *wov = ov;
-    PTRecStart(mode, topInset + 56.0, ^(NSArray *pts) {
+    // 预载已有轨迹（编辑重录）
+    if (gRecLastPts.count >= 2) { gRecCurrentPts = [NSMutableArray arrayWithArray:gRecLastPts]; PTRecDrawTrail(); }
+
+    // v1.0.20：录制完成回调——更新 tip + gRecLastPts（DVT 式 pan 抓取，松手后调用）
+    NSString *mn = modeName;
+    gRecDoneUI = ^(NSArray *pts) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (!wov || !gRecOverlay) return;
+            if (!gRecOverlay) return;
             gRecLastPts = pts;
             gRecTip.text = [NSString stringWithFormat:@"%@\n已录 %lu 点 ✓\n可重录，完成后点「完成」",
-                modeName, (unsigned long)pts.count];
+                mn, (unsigned long)pts.count];
         });
-    });
-    gRecTimer = [NSTimer scheduledTimerWithTimeInterval:0.05 target:gRecBtnTarget
-        selector:@selector(overlayTick) userInfo:nil repeats:YES];
-    [[NSRunLoop mainRunLoop] addTimer:gRecTimer forMode:UITrackingRunLoopMode];
+    };
+
+    // 开始录制：PTRecStart 仅置 gRecArmed（供 Core 守卫），真实抓取由下方 pan 手势完成
+    PTRecStart(mode, gRecTopY, gRecDoneUI);
+
+    // v1.0.20：录制手势——整个覆盖层接收 pan（按钮行内误触已在 PTRecOnPan 中排除）
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:gRecBtnTarget action:@selector(onRecPan:)];
+    [ov addGestureRecognizer:pan];
 }
 
 
