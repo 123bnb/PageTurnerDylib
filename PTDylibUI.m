@@ -1664,8 +1664,8 @@ void PTRecShowOverlay(NSString *mode, NSString *planName, NSInteger editIndex, N
     gRecTip.layer.cornerRadius = 12;
     gRecTip.layer.masksToBounds = YES;
     gRecTip.backgroundColor = [UIColor colorWithWhite:0 alpha:0.35];
-    NSString *modeName = [mode isEqualToString:@"tapManual"] ? @"点击(手动)"
-                        : ([mode isEqualToString:@"doubleTapManual"] ? @"双击(手动)" : @"滑动(手动)"];
+    // v1.0.20：DVT 式录制只做「滑动(手动)」，mode 恒为 recSwipe
+    NSString *modeName = @"滑动(手动)";
     if (gRecLastPts.count) {
         gRecTip.text = [NSString stringWithFormat:@"%@\n已录 %lu 点，可重录\n完成按钮保存覆盖",
             modeName, (unsigned long)gRecLastPts.count];
